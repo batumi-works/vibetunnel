@@ -8,7 +8,10 @@ on:
 jobs:
   sync:
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    
+    permissions:
+      contents: write
+      actions: write
+      
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,7 +47,22 @@ jobs:
       - name: Sync with upstream
         if: steps.check.outputs.sync_needed == 'true'
         run: |
+          # Create a temporary branch for the merge
+          git checkout -b temp-sync
           git merge upstream/main --no-edit
+          
+          # Reset any workflow file changes for security
+          if git diff --name-only HEAD~1 HEAD | grep -q ".github/workflows/"; then
+            echo "🔒 Excluding workflow file changes for security"
+            git checkout HEAD~1 -- .github/workflows/
+            git add .github/workflows/
+            git commit --amend --no-edit 2>/dev/null || true
+          fi
+          
+          # Switch back to main and merge the safe changes
+          git checkout main
+          git merge temp-sync --no-edit
+          git branch -d temp-sync
           git push origin main
           
       - name: Report sync status
