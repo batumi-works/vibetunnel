@@ -78,7 +78,7 @@ struct ServerConfigurationSection: View {
 
 // MARK: - Access Mode View
 
-private struct AccessModeView: View {
+struct AccessModeView: View {
     let accessMode: DashboardAccessMode
     @Binding var accessModeString: String
     let serverPort: String
@@ -108,7 +108,7 @@ private struct AccessModeView: View {
 
 // MARK: - Port Configuration View
 
-private struct PortConfigurationView: View {
+struct PortConfigurationView: View {
     @Binding var serverPort: String
     let restartServerWithNewPort: (Int) -> Void
     let serverManager: ServerManager
@@ -208,7 +208,7 @@ private struct PortConfigurationView: View {
 
 @MainActor
 enum ServerConfigurationHelpers {
-    private static let logger = Logger(subsystem: "sh.vibetunnel.vibetunnel", category: "ServerConfiguration")
+    private static let logger = Logger(subsystem: BundleIdentifiers.loggerSubsystem, category: "ServerConfiguration")
 
     static func restartServerWithNewPort(_ port: Int, serverManager: ServerManager) async {
         // Update the port in ServerManager and restart

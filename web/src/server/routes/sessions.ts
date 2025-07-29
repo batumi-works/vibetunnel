@@ -1,21 +1,26 @@
 import chalk from 'chalk';
 import { Router } from 'express';
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
+import { promisify } from 'util';
 import { cellsToText } from '../../shared/terminal-text-formatter.js';
 import type { ServerStatus, Session, SessionActivity, TitleMode } from '../../shared/types.js';
+import { HttpMethod } from '../../shared/types.js';
 import { PtyError, type PtyManager } from '../pty/index.js';
 import type { ActivityMonitor } from '../services/activity-monitor.js';
 import type { RemoteRegistry } from '../services/remote-registry.js';
 import type { StreamWatcher } from '../services/stream-watcher.js';
 import type { TerminalManager } from '../services/terminal-manager.js';
+import { detectGitInfo } from '../utils/git-info.js';
+import { getDetailedGitStatus } from '../utils/git-status.js';
 import { createLogger } from '../utils/logger.js';
+import { resolveAbsolutePath } from '../utils/path-utils.js';
 import { generateSessionName } from '../utils/session-naming.js';
 import { createControlMessage, type TerminalSpawnResponse } from '../websocket/control-protocol.js';
 import { controlUnixHandler } from '../websocket/control-unix-handler.js';
 
 const logger = createLogger('sessions');
+const _execFile = promisify(require('child_process').execFile);
 
 interface SessionRoutesConfig {
   ptyManager: PtyManager;
@@ -26,21 +31,21 @@ interface SessionRoutesConfig {
   activityMonitor: ActivityMonitor;
 }
 
-// Helper function to resolve path (handles ~)
+// Helper function to resolve path with default fallback
 function resolvePath(inputPath: string, defaultPath: string): string {
   if (!inputPath || inputPath.trim() === '') {
     return defaultPath;
   }
 
-  if (inputPath.startsWith('~/')) {
-    return path.join(os.homedir(), inputPath.slice(2));
-  }
+  // Use our utility function to handle tilde expansion and absolute path resolution
+  const expanded = resolveAbsolutePath(inputPath);
 
-  if (!path.isAbsolute(inputPath)) {
+  // If the input was relative (not starting with / or ~), resolve it relative to defaultPath
+  if (!inputPath.startsWith('/') && !inputPath.startsWith('~')) {
     return path.join(defaultPath, inputPath);
   }
 
-  return inputPath;
+  return expanded;
 }
 
 export function createSessionRoutes(config: SessionRoutesConfig): Router {
@@ -75,17 +80,41 @@ export function createSessionRoutes(config: SessionRoutesConfig): Router {
       logger.debug(`[GET /sessions] Found ${localSessions.length} local sessions`);
 
       // Log session names for debugging
-      localSessions.forEach((session) => {
-        logger.debug(
-          `[GET /sessions] Session ${session.id}: name="${session.name || 'null'}", workingDir="${session.workingDir}"`
-        );
-      });
+      // localSessions.forEach((session) => {
+      //   logger.debug(
+      //     `[GET /sessions] Session ${session.id}: name="${session.name || 'null'}", workingDir="${session.workingDir}"`
+      //   );
+      // });
 
-      // Add source info to local sessions
-      const localSessionsWithSource = localSessions.map((session) => ({
-        ...session,
-        source: 'local' as const,
-      }));
+      // Add source info to local sessions and detect Git info if missing
+      const localSessionsWithSource = await Promise.all(
+        localSessions.map(async (session) => {
+          // If session doesn't have Git info, try to detect it
+          if (!session.gitRepoPath && session.workingDir) {
+            try {
+              const gitInfo = await detectGitInfo(session.workingDir);
+              // logger.debug(
+              //   `[GET /sessions] Detected Git info for session ${session.id}: repo=${gitInfo.gitRepoPath}, branch=${gitInfo.gitBranch}`
+              // );
+              return {
+                ...session,
+                ...gitInfo,
+                source: 'local' as const,
+              };
+            } catch (error) {
+              // If Git detection fails, just return session as-is
+              logger.debug(
+                `[GET /sessions] Could not detect Git info for session ${session.id}: ${error}`
+              );
+            }
+          }
+
+          return {
+            ...session,
+            source: 'local' as const,
+          };
+        })
+      );
 
       allSessions = [...localSessionsWithSource];
 
@@ -173,7 +202,7 @@ export function createSessionRoutes(config: SessionRoutesConfig): Router {
         // Forward the request to the remote server
         const startTime = Date.now();
         const response = await fetch(`${remote.url}/api/sessions`, {
-          method: 'POST',
+          method: HttpMethod.POST,
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${remote.token}`,
@@ -213,8 +242,11 @@ export function createSessionRoutes(config: SessionRoutesConfig): Router {
         try {
           // Generate session ID
           const sessionId = generateSessionId();
-          const sessionName =
-            name || generateSessionName(command, resolvePath(workingDir, process.cwd()));
+          const resolvedCwd = resolvePath(workingDir, process.cwd());
+          const sessionName = name || generateSessionName(command, resolvedCwd);
+
+          // Detect Git information for terminal spawn
+          const gitInfo = await detectGitInfo(resolvedCwd);
 
           // Request Mac app to spawn terminal
           logger.log(
@@ -224,8 +256,15 @@ export function createSessionRoutes(config: SessionRoutesConfig): Router {
             sessionId,
             sessionName,
             command,
-            workingDir: resolvePath(workingDir, process.cwd()),
+            workingDir: resolvedCwd,
             titleMode,
+            gitRepoPath: gitInfo.gitRepoPath,
+            gitBranch: gitInfo.gitBranch,
+            gitAheadCount: gitInfo.gitAheadCount,
+            gitBehindCount: gitInfo.gitBehindCount,
+            gitHasChanges: gitInfo.gitHasChanges,
+            gitIsWorktree: gitInfo.gitIsWorktree,
+            gitMainRepoPath: gitInfo.gitMainRepoPath,
           });
 
           if (!spawnResult.success) {
@@ -261,6 +300,9 @@ export function createSessionRoutes(config: SessionRoutesConfig): Router {
 
       const sessionName = name || generateSessionName(command, cwd);
 
+      // Detect Git information
+      const gitInfo = await detectGitInfo(cwd);
+
       logger.log(
         chalk.blue(
           `creating WEB session: ${command.join(' ')} in ${cwd} (spawn_terminal=${spawn_terminal})`
@@ -273,6 +315,13 @@ export function createSessionRoutes(config: SessionRoutesConfig): Router {
         cols,
         rows,
         titleMode,
+        gitRepoPath: gitInfo.gitRepoPath,
+        gitBranch: gitInfo.gitBranch,
+        gitAheadCount: gitInfo.gitAheadCount,
+        gitBehindCount: gitInfo.gitBehindCount,
+        gitHasChanges: gitInfo.gitHasChanges,
+        gitIsWorktree: gitInfo.gitIsWorktree,
+        gitMainRepoPath: gitInfo.gitMainRepoPath,
       });
 
       const { sessionId, sessionInfo } = result;
@@ -392,6 +441,52 @@ export function createSessionRoutes(config: SessionRoutesConfig): Router {
     }
   });
 
+  // Get git status for a specific session
+  router.get('/sessions/:sessionId/git-status', async (req, res) => {
+    const sessionId = req.params.sessionId;
+
+    try {
+      // If in HQ mode, check if this is a remote session
+      if (isHQMode && remoteRegistry) {
+        const remote = remoteRegistry.getRemoteBySessionId(sessionId);
+        if (remote) {
+          // Forward to remote server
+          try {
+            const response = await fetch(`${remote.url}/api/sessions/${sessionId}/git-status`, {
+              headers: {
+                Authorization: `Bearer ${remote.token}`,
+              },
+              signal: AbortSignal.timeout(5000),
+            });
+
+            if (!response.ok) {
+              return res.status(response.status).json(await response.json());
+            }
+
+            return res.json(await response.json());
+          } catch (error) {
+            logger.error(`failed to get git status from remote ${remote.name}:`, error);
+            return res.status(503).json({ error: 'Failed to reach remote server' });
+          }
+        }
+      }
+
+      // Local session handling
+      const session = ptyManager.getSession(sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Get detailed git status for the session's working directory
+      const gitStatus = await getDetailedGitStatus(session.workingDir);
+
+      res.json(gitStatus);
+    } catch (error) {
+      logger.error(`error getting git status for session ${sessionId}:`, error);
+      res.status(500).json({ error: 'Failed to get git status' });
+    }
+  });
+
   // Get single session info
   router.get('/sessions/:sessionId', async (req, res) => {
     const sessionId = req.params.sessionId;
@@ -429,6 +524,24 @@ export function createSessionRoutes(config: SessionRoutesConfig): Router {
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
+
+      // If session doesn't have Git info, try to detect it
+      if (!session.gitRepoPath && session.workingDir) {
+        try {
+          const gitInfo = await detectGitInfo(session.workingDir);
+          // logger.debug(
+          //   `[GET /sessions/:id] Detected Git info for session ${session.id}: repo=${gitInfo.gitRepoPath}, branch=${gitInfo.gitBranch}`
+          // );
+          res.json({ ...session, ...gitInfo });
+          return;
+        } catch (error) {
+          // If Git detection fails, just return session as-is
+          logger.debug(
+            `[GET /sessions/:id] Could not detect Git info for session ${session.id}: ${error}`
+          );
+        }
+      }
+
       res.json(session);
     } catch (error) {
       logger.error('error getting session info:', error);
@@ -449,7 +562,7 @@ export function createSessionRoutes(config: SessionRoutesConfig): Router {
           // Forward kill request to remote server
           try {
             const response = await fetch(`${remote.url}/api/sessions/${sessionId}`, {
-              method: 'DELETE',
+              method: HttpMethod.DELETE,
               headers: {
                 Authorization: `Bearer ${remote.token}`,
               },
@@ -512,7 +625,7 @@ export function createSessionRoutes(config: SessionRoutesConfig): Router {
           // Forward cleanup request to remote server
           try {
             const response = await fetch(`${remote.url}/api/sessions/${sessionId}/cleanup`, {
-              method: 'DELETE',
+              method: HttpMethod.DELETE,
               headers: {
                 Authorization: `Bearer ${remote.token}`,
               },
@@ -576,7 +689,7 @@ export function createSessionRoutes(config: SessionRoutesConfig): Router {
         const remoteCleanupPromises = allRemotes.map(async (remote) => {
           try {
             const response = await fetch(`${remote.url}/api/cleanup-exited`, {
-              method: 'POST',
+              method: HttpMethod.POST,
               headers: {
                 'Content-Type': 'application/json',
                 Authorization: `Bearer ${remote.token}`,
@@ -932,7 +1045,7 @@ export function createSessionRoutes(config: SessionRoutesConfig): Router {
           // Forward input to remote server
           try {
             const response = await fetch(`${remote.url}/api/sessions/${sessionId}/input`, {
-              method: 'POST',
+              method: HttpMethod.POST,
               headers: {
                 'Content-Type': 'application/json',
                 Authorization: `Bearer ${remote.token}`,
@@ -997,7 +1110,8 @@ export function createSessionRoutes(config: SessionRoutesConfig): Router {
       return res.status(400).json({ error: 'Cols and rows must be between 1 and 1000' });
     }
 
-    logger.log(chalk.blue(`resizing session ${sessionId} to ${cols}x${rows}`));
+    // Log resize requests at debug level
+    logger.debug(`Resizing session ${sessionId} to ${cols}x${rows}`);
 
     try {
       // If in HQ mode, check if this is a remote session
@@ -1007,7 +1121,7 @@ export function createSessionRoutes(config: SessionRoutesConfig): Router {
           // Forward resize to remote server
           try {
             const response = await fetch(`${remote.url}/api/sessions/${sessionId}/resize`, {
-              method: 'POST',
+              method: HttpMethod.POST,
               headers: {
                 'Content-Type': 'application/json',
                 Authorization: `Bearer ${remote.token}`,
@@ -1079,7 +1193,7 @@ export function createSessionRoutes(config: SessionRoutesConfig): Router {
           // Forward update to remote server
           try {
             const response = await fetch(`${remote.url}/api/sessions/${sessionId}`, {
-              method: 'PATCH',
+              method: HttpMethod.PATCH,
               headers: {
                 'Content-Type': 'application/json',
                 Authorization: `Bearer ${remote.token}`,
@@ -1138,7 +1252,7 @@ export function createSessionRoutes(config: SessionRoutesConfig): Router {
         if (remote) {
           logger.debug(`forwarding reset-size to remote ${remote.id}`);
           const response = await fetch(`${remote.url}/api/sessions/${sessionId}/reset-size`, {
-            method: 'POST',
+            method: HttpMethod.POST,
             headers: {
               'Content-Type': 'application/json',
               Authorization: `Bearer ${remote.token}`,
@@ -1218,6 +1332,13 @@ export async function requestTerminalSpawn(params: {
   command: string[];
   workingDir: string;
   titleMode?: TitleMode;
+  gitRepoPath?: string;
+  gitBranch?: string;
+  gitAheadCount?: number;
+  gitBehindCount?: number;
+  gitHasChanges?: boolean;
+  gitIsWorktree?: boolean;
+  gitMainRepoPath?: string;
 }): Promise<{ success: boolean; error?: string }> {
   try {
     // Create control message for terminal spawn
@@ -1229,6 +1350,13 @@ export async function requestTerminalSpawn(params: {
         workingDirectory: params.workingDir,
         command: params.command.join(' '),
         terminalPreference: null, // Let Mac app use default terminal
+        gitRepoPath: params.gitRepoPath,
+        gitBranch: params.gitBranch,
+        gitAheadCount: params.gitAheadCount,
+        gitBehindCount: params.gitBehindCount,
+        gitHasChanges: params.gitHasChanges,
+        gitIsWorktree: params.gitIsWorktree,
+        gitMainRepoPath: params.gitMainRepoPath,
       },
       params.sessionId
     );

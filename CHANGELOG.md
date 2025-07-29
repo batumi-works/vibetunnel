@@ -1,5 +1,131 @@
 # Changelog
 
+## [1.0.0-beta.15] - 2025-07-28
+
+### ✨ Major Features
+
+#### **Git Worktree Management**
+- Full worktree support: Create, manage, and delete Git worktrees directly from VibeTunnel
+- Follow Mode: Terminal sessions automatically navigate to corresponding directories when switching Git branches
+- Visual indicators: Fork icon (⑂) shows worktree sessions, branch names displayed throughout UI
+- HTTP Git API: New endpoints for Git operations (`/api/git/status`, `/api/git/branches`, `/api/worktrees`)
+- Branch selection: Choose branches before creating sessions with real-time repository status
+
+#### **Git Worktree Follow Mode** 
+- VibeTunnel now intelligently follows Git worktrees instead of just branches, making it perfect for developers who use worktrees for parallel development
+- When you switch branches in your editor/IDE, VibeTunnel automatically switches to the corresponding worktree terminal session
+- The `vt follow` command now works contextually - run it from either your main repository or a worktree, and it sets up the appropriate tracking
+- Follow mode displays worktree paths with `~` for your home directory, making them easier to read
+
+#### **Robust Command Communication**
+- The `vt` command now uses Unix domain sockets instead of HTTP for more reliable communication
+- No more port discovery issues - commands like `vt status`, `vt follow`, and `vt unfollow` work instantly
+- Socket-based API at `~/.vibetunnel/api.sock` provides consistent command execution
+
+#### **Mac Menu Bar Keyboard Navigation**
+- Navigate sessions with arrow keys (↑/↓) with wraparound support
+- Press Enter to focus terminal windows or open web sessions
+- Visual focus indicators appear automatically when using keyboard
+- Menu closes after selecting a session or opening settings
+
+#### **Quick Session Switching with Number Keys**
+- When keyboard capture is active, use Cmd+1...9 (Mac) or Ctrl+1...9 (Linux) to instantly switch between sessions
+- Cmd/Ctrl+0 switches to the 10th session
+- Works only when keyboard capture is enabled in session view, allowing quick navigation without mouse
+- Session numbers match the numbers shown in the session list
+
+### 🎨 UI/UX Improvements
+
+#### **Enhanced Git Integration**
+- See branch names, commit status, and sync state in autocomplete suggestions
+- Real-time display of uncommitted changes (added/modified/deleted files)
+- Branch selector dropdown for switching branches before creating sessions
+- Repository grouping in session list with branch/worktree selectors
+- Consistent branch name formatting with square brackets: `[main]`
+
+#### **Interface Polish**
+- Responsive design: Better mobile/iPad layouts with adaptive button switching
+- Collapsible options: Session options now in expandable sections for cleaner UI
+- Increased menu bar button heights for better clickability
+- Improved spacing and padding throughout the interface
+- Smoother animations and transitions
+
+### 🐛 Bug Fixes
+
+#### **Stability & Performance**
+- Fixed menu bar icon not appearing on app launch
+- Resolved memory leaks causing OOM crashes during test runs
+- Fixed Node.js v24.3.0 fs.cpSync crash with workaround
+- Improved CI performance with better caching and parallel jobs
+- Fixed EventSource handling in tests
+
+#### **UI Fixes**
+- Autocomplete dropdown only shows when text field is focused
+- Fixed drag & drop overlay persistence issues
+- Resolved CSS/JS resource loading on nested routes
+- Fixed terminal output corruption in high-volume sessions
+- Corrected menu bar icon opacity states
+- **Terminal Settings UI Restored**: Fixed missing terminal width selector, restored grid layout for width/font/theme options
+- **Worktree Selection UI Improvements**: Fixed confusing dropdown behavior, consistent text regardless of selection state
+- **Intelligent Cursor Following**: Restored smart cursor tracking that keeps cursor visible during text input
+
+### 🔧 Technical Improvements
+
+#### **Architecture**
+- Modular refactoring: Split `session-view.ts` into 7 specialized managers
+- Component breakdown: Refactored `session-create-form` into smaller components
+- Unified components: Created reusable `GitBranchWorktreeSelector`
+- Better separation: Clear boundaries between UI and business logic
+- **Session rename functionality centralized**: Eliminated duplicate code across components
+- **Socket-based vt command communication**: Replaced HTTP with Unix domain sockets for reliability
+
+#### **Test Infrastructure**
+- Comprehensive test cleanup preventing memory exhaustion
+- Updated Playwright tests for new UI structure
+- Fixed TypeScript strict mode compliance
+- Proper mock cleanup and session management
+- Re-enabled previously disabled test files after fixing memory issues
+
+#### **Developer Experience**
+- Improved TypeScript type safety throughout
+- Better error handling and logging
+- Consistent code formatting across macOS and web codebases
+- Removed outdated crash investigation documentation
+- Comprehensive JSDoc documentation added to service classes
+- Removed backwards compatibility for older vt command versions
+
+#### **Push Notifications**
+- Native push notifications for terminal events - get notified when commands complete, sessions start/end, or errors occur
+- Customizable notification types: Session exits, command completion (>3s), command errors, terminal bell, Claude AI turn notifications
+- Web-based onboarding flow for easy setup on macOS and mobile devices
+- Privacy-focused: All notifications are processed locally, no terminal content is sent to servers
+- Smart Claude detection: Automatically identifies Claude CLI sessions and tracks when Claude finishes responding
+
+#### **Improved Terminal Output Handling**
+- Enhanced asciinema stream pruning: Removes noisy ANSI sequences for cleaner recordings
+- Better mobile terminal detection to optimize output rendering
+- Fixed terminal resize event handling to prevent output corruption
+- Improved logging for debugging terminal lifecycle issues
+
+#### **UI/UX Enhancements**
+- Modernized macOS autocomplete dropdown with native SwiftUI materials and transparency
+- Fixed Quick Start Commands UI with proper native macOS table styling
+- Added help tooltips throughout settings UI explaining each notification type
+- Fixed mouse hover selection issues in autocomplete dropdown
+- Improved button click targets for better usability
+
+#### **Socket API Improvements**
+- Refactored socket client with type-safe message handling
+- Removed HTTP fallback in favor of pure socket communication for better reliability
+- Added proper TypeScript types for all socket protocol messages
+- Cleaner public API without brittle type casting
+
+#### **Developer Tools**
+- Added `VIBETUNNEL_PREFER_DERIVED_DATA` environment variable for faster Xcode builds
+- Version tracking in socket protocol for better debugging
+- Consolidated duplicate Git status implementations for maintainability
+- Enhanced error logging for session termination debugging
+
 ## [1.0.0-beta.14] - 2025-07-21
 
 ### ✨ Major Features

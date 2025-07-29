@@ -16,7 +16,7 @@ struct SecurityPermissionsSettingsView: View {
 
     @State private var permissionUpdateTrigger = 0
 
-    private let logger = Logger(subsystem: "sh.vibetunnel.vibetunnel", category: "SecurityPermissionsSettings")
+    private let logger = Logger(subsystem: BundleIdentifiers.loggerSubsystem, category: "SecurityPermissionsSettings")
 
     // MARK: - Helper Properties
 
@@ -60,13 +60,12 @@ struct SecurityPermissionsSettingsView: View {
             .navigationTitle("Security")
             .onAppear {
                 onAppearSetup()
+                // Register for continuous monitoring
+                permissionManager.registerForMonitoring()
             }
             .task {
                 // Check permissions before first render to avoid UI flashing
                 await permissionManager.checkAllPermissions()
-
-                // Register for continuous monitoring
-                permissionManager.registerForMonitoring()
             }
             .onDisappear {
                 permissionManager.unregisterFromMonitoring()
@@ -185,118 +184,6 @@ private struct SecuritySection: View {
                 .font(.caption)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: .infinity)
-        }
-    }
-}
-
-// MARK: - Permissions Section
-
-private struct PermissionsSection: View {
-    let hasAppleScriptPermission: Bool
-    let hasAccessibilityPermission: Bool
-    let permissionManager: SystemPermissionManager
-
-    var body: some View {
-        Section {
-            // Automation permission
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Terminal Automation")
-                        .font(.body)
-                    Text("Required to launch and control terminal applications.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-
-                if hasAppleScriptPermission {
-                    HStack {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
-                        Text("Granted")
-                            .foregroundColor(.secondary)
-                    }
-                    .font(.caption)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 2)
-                    .frame(height: 22) // Match small button height
-                    .contextMenu {
-                        Button("Refresh Status") {
-                            permissionManager.forcePermissionRecheck()
-                        }
-                        Button("Open System Settings...") {
-                            permissionManager.requestPermission(.appleScript)
-                        }
-                    }
-                } else {
-                    Button("Grant Permission") {
-                        permissionManager.requestPermission(.appleScript)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-            }
-
-            // Accessibility permission
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Accessibility")
-                        .font(.body)
-                    Text("Required to enter terminal startup commands.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-
-                if hasAccessibilityPermission {
-                    HStack {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
-                        Text("Granted")
-                            .foregroundColor(.secondary)
-                    }
-                    .font(.caption)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 2)
-                    .frame(height: 22) // Match small button height
-                    .contextMenu {
-                        Button("Refresh Status") {
-                            permissionManager.forcePermissionRecheck()
-                        }
-                        Button("Open System Settings...") {
-                            permissionManager.requestPermission(.accessibility)
-                        }
-                    }
-                } else {
-                    Button("Grant Permission") {
-                        permissionManager.requestPermission(.accessibility)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-            }
-        } header: {
-            Text("System Permissions")
-                .font(.headline)
-        } footer: {
-            if hasAppleScriptPermission && hasAccessibilityPermission {
-                Text(
-                    "All permissions granted. VibeTunnel has full functionality."
-                )
-                .font(.caption)
-                .frame(maxWidth: .infinity)
-                .multilineTextAlignment(.center)
-                .foregroundColor(.green)
-            } else {
-                Text(
-                    "Terminals can be captured without permissions, however new sessions won't load."
-                )
-                .font(.caption)
-                .frame(maxWidth: .infinity)
-                .multilineTextAlignment(.center)
-            }
         }
     }
 }

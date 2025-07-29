@@ -1,82 +1,63 @@
-import Combine
 import Foundation
+import Observation
 import OSLog
 
 /// Manager for VibeTunnel configuration stored in ~/.vibetunnel/config.json
 /// Provides centralized configuration management for all app settings
 @MainActor
-class ConfigManager: ObservableObject {
+@Observable
+final class ConfigManager {
     static let shared = ConfigManager()
 
-    private let logger = Logger(subsystem: "sh.vibetunnel.vibetunnel", category: "ConfigManager")
+    private let logger = Logger(subsystem: BundleIdentifiers.loggerSubsystem, category: "ConfigManager")
     private let configDir: URL
     private let configPath: URL
     private var fileMonitor: DispatchSourceFileSystemObject?
 
     // Core configuration
-    @Published private(set) var quickStartCommands: [QuickStartCommand] = []
-    @Published var repositoryBasePath: String = FilePathConstants.defaultRepositoryBasePath
+    private(set) var quickStartCommands: [QuickStartCommand] = []
+    var repositoryBasePath: String = FilePathConstants.defaultRepositoryBasePath
 
     // Server settings
-    @Published var serverPort: Int = 4_020
-    @Published var dashboardAccessMode: DashboardAccessMode = .network
-    @Published var cleanupOnStartup: Bool = true
-    @Published var authenticationMode: AuthenticationMode = .osAuth
+    var serverPort: Int = 4_020
+    var dashboardAccessMode: DashboardAccessMode = .network
+    var cleanupOnStartup: Bool = true
+    var authenticationMode: AuthenticationMode = .osAuth
 
     // Development settings
-    @Published var debugMode: Bool = false
-    @Published var useDevServer: Bool = false
-    @Published var devServerPath: String = ""
-    @Published var logLevel: String = "info"
+    var debugMode: Bool = false
+    var useDevServer: Bool = false
+    var devServerPath: String = ""
+    var logLevel: String = "info"
 
     // Application preferences
-    @Published var preferredGitApp: String?
-    @Published var preferredTerminal: String?
-    @Published var updateChannel: UpdateChannel = .stable
-    @Published var showInDock: Bool = false
-    @Published var preventSleepWhenRunning: Bool = true
+    var preferredGitApp: String?
+    var preferredTerminal: String?
+    var updateChannel: UpdateChannel = .stable
+    var showInDock: Bool = false
+    var preventSleepWhenRunning: Bool = true
+
+    // Notification preferences
+    var notificationsEnabled: Bool = true
+    var notificationSessionStart: Bool = true
+    var notificationSessionExit: Bool = true
+    var notificationCommandCompletion: Bool = true
+    var notificationCommandError: Bool = true
+    var notificationBell: Bool = true
+    var notificationClaudeTurn: Bool = false
+    var notificationSoundEnabled: Bool = true
+    var notificationVibrationEnabled: Bool = true
+    var showInNotificationCenter: Bool = true
 
     // Remote access
-    @Published var ngrokEnabled: Bool = false
-    @Published var ngrokTokenPresent: Bool = false
+    var ngrokEnabled: Bool = false
+    var ngrokTokenPresent: Bool = false
 
     // Session defaults
-    @Published var sessionCommand: String = "zsh"
-    @Published var sessionWorkingDirectory: String = FilePathConstants.defaultRepositoryBasePath
-    @Published var sessionSpawnWindow: Bool = true
-    @Published var sessionTitleMode: TitleMode = .dynamic
-
-    /// Quick start command structure matching the web interface
-    struct QuickStartCommand: Identifiable, Codable, Equatable {
-        var id: String
-        var name: String?
-        var command: String
-
-        /// Display name for the UI - uses name if available, otherwise command
-        var displayName: String {
-            name ?? command
-        }
-
-        init(id: String = UUID().uuidString, name: String? = nil, command: String) {
-            self.id = id
-            self.name = name
-            self.command = command
-        }
-
-        /// Custom Codable implementation to handle missing id
-        init(from decoder: Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
-            self.name = try container.decodeIfPresent(String.self, forKey: .name)
-            self.command = try container.decode(String.self, forKey: .command)
-        }
-
-        private enum CodingKeys: String, CodingKey {
-            case id
-            case name
-            case command
-        }
-    }
+    var sessionCommand: String = "zsh"
+    var sessionWorkingDirectory: String = FilePathConstants.defaultRepositoryBasePath
+    var sessionSpawnWindow: Bool = true
+    var sessionTitleMode: TitleMode = .dynamic
 
     /// Comprehensive configuration structure
     private struct VibeTunnelConfig: Codable {
@@ -114,6 +95,20 @@ class ConfigManager: ObservableObject {
         var updateChannel: String
         var showInDock: Bool
         var preventSleepWhenRunning: Bool
+        var notifications: NotificationConfig?
+    }
+
+    private struct NotificationConfig: Codable {
+        var enabled: Bool
+        var sessionStart: Bool
+        var sessionExit: Bool
+        var commandCompletion: Bool
+        var commandError: Bool
+        var bell: Bool
+        var claudeTurn: Bool
+        var soundEnabled: Bool
+        var vibrationEnabled: Bool
+        var showInNotificationCenter: Bool?
     }
 
     private struct RemoteAccessConfig: Codable {
@@ -130,7 +125,7 @@ class ConfigManager: ObservableObject {
 
     /// Default commands matching web/src/types/config.ts
     private let defaultCommands = [
-        QuickStartCommand(name: "✨ claude", command: "claude"),
+        QuickStartCommand(name: "✨ claude", command: "claude --dangerously-skip-permissions"),
         QuickStartCommand(name: "✨ gemini", command: "gemini"),
         QuickStartCommand(name: nil, command: "zsh"),
         QuickStartCommand(name: nil, command: "python3"),
@@ -188,6 +183,22 @@ class ConfigManager: ObservableObject {
                     self.updateChannel = UpdateChannel(rawValue: prefs.updateChannel) ?? .stable
                     self.showInDock = prefs.showInDock
                     self.preventSleepWhenRunning = prefs.preventSleepWhenRunning
+
+                    // Notification preferences
+                    if let notif = prefs.notifications {
+                        self.notificationsEnabled = notif.enabled
+                        self.notificationSessionStart = notif.sessionStart
+                        self.notificationSessionExit = notif.sessionExit
+                        self.notificationCommandCompletion = notif.commandCompletion
+                        self.notificationCommandError = notif.commandError
+                        self.notificationBell = notif.bell
+                        self.notificationClaudeTurn = notif.claudeTurn
+                        self.notificationSoundEnabled = notif.soundEnabled
+                        self.notificationVibrationEnabled = notif.vibrationEnabled
+                        if let showInCenter = notif.showInNotificationCenter {
+                            self.showInNotificationCenter = showInCenter
+                        }
+                    }
                 }
 
                 // Remote access
@@ -218,6 +229,20 @@ class ConfigManager: ObservableObject {
     private func useDefaults() {
         self.quickStartCommands = defaultCommands
         self.repositoryBasePath = FilePathConstants.defaultRepositoryBasePath
+
+        // Set notification defaults to match TypeScript defaults
+        // Master switch is OFF by default, but individual preferences are set to true
+        self.notificationsEnabled = false // Changed from true to match web defaults
+        self.notificationSessionStart = true
+        self.notificationSessionExit = true
+        self.notificationCommandCompletion = true
+        self.notificationCommandError = true
+        self.notificationBell = true
+        self.notificationClaudeTurn = false
+        self.notificationSoundEnabled = true
+        self.notificationVibrationEnabled = true
+        self.showInNotificationCenter = true
+
         saveConfiguration()
     }
 
@@ -252,7 +277,19 @@ class ConfigManager: ObservableObject {
             preferredTerminal: preferredTerminal,
             updateChannel: updateChannel.rawValue,
             showInDock: showInDock,
-            preventSleepWhenRunning: preventSleepWhenRunning
+            preventSleepWhenRunning: preventSleepWhenRunning,
+            notifications: NotificationConfig(
+                enabled: notificationsEnabled,
+                sessionStart: notificationSessionStart,
+                sessionExit: notificationSessionExit,
+                commandCompletion: notificationCommandCompletion,
+                commandError: notificationCommandError,
+                bell: notificationBell,
+                claudeTurn: notificationClaudeTurn,
+                soundEnabled: notificationSoundEnabled,
+                vibrationEnabled: notificationVibrationEnabled,
+                showInNotificationCenter: showInNotificationCenter
+            )
         )
 
         // Remote access
@@ -400,6 +437,33 @@ class ConfigManager: ObservableObject {
         self.repositoryBasePath = path
         saveConfiguration()
         logger.info("Updated repository base path to: \(path)")
+    }
+
+    /// Update notification preferences
+    func updateNotificationPreferences(
+        enabled: Bool? = nil,
+        sessionStart: Bool? = nil,
+        sessionExit: Bool? = nil,
+        commandCompletion: Bool? = nil,
+        commandError: Bool? = nil,
+        bell: Bool? = nil,
+        claudeTurn: Bool? = nil,
+        soundEnabled: Bool? = nil,
+        vibrationEnabled: Bool? = nil
+    ) {
+        // Update only the provided values
+        if let enabled { self.notificationsEnabled = enabled }
+        if let sessionStart { self.notificationSessionStart = sessionStart }
+        if let sessionExit { self.notificationSessionExit = sessionExit }
+        if let commandCompletion { self.notificationCommandCompletion = commandCompletion }
+        if let commandError { self.notificationCommandError = commandError }
+        if let bell { self.notificationBell = bell }
+        if let claudeTurn { self.notificationClaudeTurn = claudeTurn }
+        if let soundEnabled { self.notificationSoundEnabled = soundEnabled }
+        if let vibrationEnabled { self.notificationVibrationEnabled = vibrationEnabled }
+
+        saveConfiguration()
+        logger.info("Updated notification preferences")
     }
 
     /// Get the configuration file path for debugging

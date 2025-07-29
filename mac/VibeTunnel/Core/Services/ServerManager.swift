@@ -60,6 +60,16 @@ class ServerManager {
         set { UserDefaults.standard.set(newValue, forKey: UserDefaultsKeys.serverPort) }
     }
 
+    /// The local authentication token for the current server instance
+    var localAuthToken: String? {
+        bunServer?.localToken
+    }
+
+    /// The current authentication mode of the server
+    var authMode: String {
+        bunServer?.authMode ?? "os"
+    }
+
     var bindAddress: String {
         get {
             // Get the raw value from UserDefaults, defaulting to the app default
@@ -69,10 +79,11 @@ class ServerManager {
             let mode = DashboardAccessMode(rawValue: rawValue) ?? .network
 
             // Log for debugging
-            logger
-                .debug(
-                    "bindAddress getter: rawValue='\(rawValue)', mode=\(mode.rawValue), bindAddress=\(mode.bindAddress)"
-                )
+            // logger
+            //     .debug(
+            //         "bindAddress getter: rawValue='\(rawValue)', mode=\(mode.rawValue),
+            //         bindAddress=\(mode.bindAddress)"
+            //     )
 
             return mode.bindAddress
         }
@@ -94,6 +105,11 @@ class ServerManager {
     private(set) var isRunning = false
     private(set) var isRestarting = false
     private(set) var lastError: Error?
+
+    /// The process ID of the running server, if available
+    var serverProcessId: Int32? {
+        bunServer?.processIdentifier
+    }
 
     /// Track if we're in the middle of handling a crash to prevent multiple restarts
     private var isHandlingCrash = false
@@ -245,6 +261,9 @@ class ServerManager {
                 lastError = nil
                 // Reset crash counter on successful start
                 consecutiveCrashes = 0
+
+                // Start notification service
+                await NotificationService.shared.start()
             } else {
                 logger.error("Server started but not in running state")
                 isRunning = false
@@ -258,6 +277,7 @@ class ServerManager {
             // Initialize terminal control handler
             // The handler registers itself with SharedUnixSocketManager during init
             _ = TerminalControlHandler.shared
+
             // Note: SystemControlHandler is initialized in AppDelegate via
             // SharedUnixSocketManager.initializeSystemHandler()
 
@@ -293,6 +313,8 @@ class ServerManager {
         bunServer = nil
 
         isRunning = false
+
+        // Notification service connection is now handled explicitly via start() method
 
         // Clear the auth token from SessionMonitor
         SessionMonitor.shared.setLocalAuthToken(nil)
@@ -354,29 +376,18 @@ class ServerManager {
         try? await Task.sleep(for: .milliseconds(10_000))
 
         do {
-            // Create URL for cleanup endpoint
-            guard let url = URL(string: "\(URLConstants.localServerBase):\(self.port)\(APIEndpoints.cleanupExited)")
-            else {
-                logger.warning("Failed to create cleanup URL")
-                return
-            }
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
+            // Create authenticated request for cleanup
+            var request = try makeRequest(endpoint: APIEndpoints.cleanupExited, method: "POST")
             request.timeoutInterval = 10
-
-            // Add local auth token if available
-            if let server = bunServer {
-                request.setValue(server.localToken, forHTTPHeaderField: NetworkConstants.localAuthHeader)
-            }
 
             // Make the cleanup request
             let (data, response) = try await URLSession.shared.data(for: request)
 
             if let httpResponse = response as? HTTPURLResponse {
                 if httpResponse.statusCode == 200 {
-                    // Try to parse the response
+                    // Parse the server response
                     if let jsonData = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                       let cleanedCount = jsonData["cleaned_count"] as? Int
+                       let cleanedCount = jsonData["localCleaned"] as? Int
                     {
                         logger.info("Initial cleanup completed: cleaned \(cleanedCount) exited sessions")
                     } else {
@@ -571,6 +582,142 @@ class ServerManager {
             throw ServerError.startupFailed(ErrorMessages.serverNotRunning)
         }
         request.setValue(server.localToken, forHTTPHeaderField: NetworkConstants.localAuthHeader)
+    }
+
+    // MARK: - Request Helpers
+
+    /// Build a URL for the local server with the given endpoint
+    func buildURL(endpoint: String) -> URL? {
+        URL(string: "\(URLConstants.localServerBase):\(port)\(endpoint)")
+    }
+
+    /// Build a URL for the local server with the given endpoint and query parameters
+    func buildURL(endpoint: String, queryItems: [URLQueryItem]?) -> URL? {
+        guard let baseURL = buildURL(endpoint: endpoint) else { return nil }
+
+        guard let queryItems, !queryItems.isEmpty else {
+            return baseURL
+        }
+
+        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        components?.queryItems = queryItems
+        return components?.url
+    }
+
+    /// Create an authenticated JSON request
+    func makeRequest(
+        endpoint: String,
+        method: String = "POST",
+        body: Encodable? = nil,
+        queryItems: [URLQueryItem]? = nil
+    )
+        throws -> URLRequest
+    {
+        let url: URL? = if let queryItems, !queryItems.isEmpty {
+            buildURL(endpoint: endpoint, queryItems: queryItems)
+        } else {
+            buildURL(endpoint: endpoint)
+        }
+
+        guard let url else {
+            throw URLError(.badURL)
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.setValue(NetworkConstants.contentTypeJSON, forHTTPHeaderField: NetworkConstants.contentTypeHeader)
+        request.setValue(NetworkConstants.localhost, forHTTPHeaderField: NetworkConstants.hostHeader)
+
+        if let body {
+            request.httpBody = try JSONEncoder().encode(body)
+        }
+
+        try authenticate(request: &request)
+
+        return request
+    }
+}
+
+// MARK: - Network Request Extension
+
+extension ServerManager {
+    /// Perform a network request with automatic JSON parsing and error handling
+    /// - Parameters:
+    ///   - endpoint: The API endpoint path
+    ///   - method: HTTP method (default: "POST")
+    ///   - body: Optional request body (Encodable)
+    ///   - queryItems: Optional query parameters
+    ///   - responseType: The expected response type (must be Decodable)
+    /// - Returns: Decoded response of the specified type
+    /// - Throws: NetworkError for various failure cases
+    func performRequest<T: Decodable>(
+        endpoint: String,
+        method: String = "POST",
+        body: Encodable? = nil,
+        queryItems: [URLQueryItem]? = nil,
+        responseType: T.Type
+    )
+        async throws -> T
+    {
+        let request = try makeRequest(
+            endpoint: endpoint,
+            method: method,
+            body: body,
+            queryItems: queryItems
+        )
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw NetworkError.invalidResponse
+        }
+
+        guard (200...299).contains(httpResponse.statusCode) else {
+            let errorData = try? JSONDecoder().decode(ErrorResponse.self, from: data)
+            throw NetworkError.serverError(
+                statusCode: httpResponse.statusCode,
+                message: errorData?.error ?? "Request failed with status \(httpResponse.statusCode)"
+            )
+        }
+
+        return try JSONDecoder().decode(T.self, from: data)
+    }
+
+    /// Perform a network request that returns no body (void response)
+    /// - Parameters:
+    ///   - endpoint: The API endpoint path
+    ///   - method: HTTP method (default: "POST")
+    ///   - body: Optional request body (Encodable)
+    ///   - queryItems: Optional query parameters
+    /// - Throws: NetworkError for various failure cases
+    func performVoidRequest(
+        endpoint: String,
+        method: String = "POST",
+        body: Encodable? = nil,
+        queryItems: [URLQueryItem]? = nil
+    )
+        async throws
+    {
+        let request = try makeRequest(
+            endpoint: endpoint,
+            method: method,
+            body: body,
+            queryItems: queryItems
+        )
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw NetworkError.invalidResponse
+        }
+
+        guard (200...299).contains(httpResponse.statusCode) else {
+            let errorData = try? JSONDecoder().decode(ErrorResponse.self, from: data)
+            throw NetworkError.serverError(
+                statusCode: httpResponse.statusCode,
+                message: errorData?.error ?? "Request failed with status \(httpResponse.statusCode)"
+            )
+        }
     }
 }
 

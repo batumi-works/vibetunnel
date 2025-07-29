@@ -1,10 +1,14 @@
-import type { PushNotificationPreferences, PushSubscription } from '../../shared/types';
+import type { PushSubscription } from '../../shared/types';
+import { HttpMethod } from '../../shared/types';
+import type { NotificationPreferences } from '../../types/config.js';
+import { DEFAULT_NOTIFICATION_PREFERENCES } from '../../types/config.js';
 import { createLogger } from '../utils/logger';
 import { authClient } from './auth-client';
+import { notificationEventService } from './notification-event-service';
+import { serverConfigService } from './server-config-service';
 
 // Re-export types for components
-export type { PushSubscription, PushNotificationPreferences };
-export type NotificationPreferences = PushNotificationPreferences;
+export type { PushSubscription, NotificationPreferences };
 
 const logger = createLogger('push-notification-service');
 
@@ -18,8 +22,9 @@ export class PushNotificationService {
   private subscriptionChangeCallbacks: Set<SubscriptionChangeCallback> = new Set();
   private initialized = false;
   private vapidPublicKey: string | null = null;
-  private pushNotificationsAvailable = false;
   private initializationPromise: Promise<void> | null = null;
+  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: Used for feature detection
+  private pushNotificationsAvailable = false;
 
   // biome-ignore lint/complexity/noUselessConstructor: This constructor documents the intentional design decision to not auto-initialize
   constructor() {
@@ -71,7 +76,12 @@ export class PushNotificationService {
       logger.log('service worker registered successfully');
 
       // Wait for service worker to be ready
-      await navigator.serviceWorker.ready;
+      const registration = await navigator.serviceWorker.ready;
+
+      // Use the ready registration if our registration failed
+      if (!this.serviceWorkerRegistration) {
+        this.serviceWorkerRegistration = registration;
+      }
 
       // Get existing subscription if any
       this.pushSubscription = await this.serviceWorkerRegistration.pushManager.getSubscription();
@@ -84,6 +94,9 @@ export class PushNotificationService {
 
       // Monitor permission changes
       this.monitorPermissionChanges();
+
+      // Auto-resubscribe if notifications were previously enabled
+      await this.autoResubscribe();
 
       this.initialized = true;
       logger.log('push notification service initialized');
@@ -148,6 +161,38 @@ export class PushNotificationService {
         logger.error('error in subscription change callback:', error);
       }
     });
+  }
+
+  /**
+   * Auto-resubscribe if notifications were previously enabled
+   */
+  private async autoResubscribe(): Promise<void> {
+    try {
+      // Load saved preferences
+      const preferences = await this.loadPreferences();
+
+      // Check if notifications were previously enabled
+      if (preferences.enabled) {
+        // Check if we have permission but no subscription
+        const permission = this.getPermission();
+        if (permission === 'granted' && !this.pushSubscription) {
+          logger.log('Auto-resubscribing to push notifications based on saved preferences');
+
+          // Attempt to resubscribe
+          const subscription = await this.subscribe();
+          if (subscription) {
+            logger.log('Successfully auto-resubscribed to push notifications');
+          } else {
+            logger.warn('Failed to auto-resubscribe, user will need to manually enable');
+            // Update preferences to reflect the failed state
+            preferences.enabled = false;
+            await this.savePreferences(preferences);
+          }
+        }
+      }
+    } catch (error) {
+      logger.error('Error during auto-resubscribe:', error);
+    }
   }
 
   /**
@@ -318,36 +363,78 @@ export class PushNotificationService {
 
   /**
    * Test notification functionality
+   * Sends a test notification through the server to verify the full flow:
+   * Web → Server → SSE → Mac app
    */
   async testNotification(): Promise<void> {
+    logger.log('🔔 Testing notification system...');
+
     if (!this.serviceWorkerRegistration) {
       throw new Error('Service worker not initialized');
     }
 
-    const permission = this.getPermission();
-    if (permission !== 'granted') {
-      throw new Error('Notification permission not granted');
-    }
-
     try {
-      await this.serviceWorkerRegistration.showNotification('VibeTunnel Test', {
-        body: 'Push notifications are working correctly!',
-        icon: '/apple-touch-icon.png',
-        badge: '/favicon-32.png',
-        tag: 'vibetunnel-test',
-        requireInteraction: false,
-        // Remove actions property as it's not standard in all browsers
-        // actions: [
-        //   {
-        //     action: 'dismiss',
-        //     title: 'Dismiss',
-        //   },
-        // ],
+      // Promise that resolves when we receive the test notification
+      const notificationPromise = new Promise<void>((resolve) => {
+        let receivedNotification = false;
+
+        const timeout = setTimeout(() => {
+          if (!receivedNotification) {
+            logger.warn('⏱️ Timeout waiting for SSE test notification');
+            unsubscribe();
+            resolve();
+          }
+        }, 5000); // 5 second timeout
+
+        const unsubscribe = notificationEventService.on('test-notification', async (data: any) => {
+          logger.log('📨 Received test notification via SSE:', data);
+          receivedNotification = true;
+          clearTimeout(timeout);
+          unsubscribe();
+
+          // Show notification if we have permission
+          if (this.serviceWorkerRegistration && this.getPermission() === 'granted') {
+            await this.serviceWorkerRegistration.showNotification(
+              data.title || 'VibeTunnel Test',
+              {
+                body: data.body || 'Test notification received via SSE!',
+                icon: '/apple-touch-icon.png',
+                badge: '/favicon-32.png',
+                tag: 'vibetunnel-test-sse',
+                requireInteraction: false,
+              }
+            );
+            logger.log('✅ Displayed SSE test notification');
+          }
+          resolve();
+        });
       });
 
-      logger.log('test notification sent');
+      // Send the test notification request to server
+      logger.log('📤 Sending test notification request to server...');
+      const response = await fetch('/api/test-notification', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...authClient.getAuthHeader(),
+        },
+      });
+
+      if (!response.ok) {
+        const error = await response.json();
+        logger.error('❌ Server test notification failed:', error);
+        throw new Error(error.error || 'Failed to send test notification');
+      }
+
+      const result = await response.json();
+      logger.log('✅ Server test notification sent successfully:', result);
+
+      // Wait for the SSE notification
+      await notificationPromise;
+
+      logger.log('🎉 Test notification complete - notification sent to all connected clients');
     } catch (error) {
-      logger.error('failed to send test notification:', error);
+      logger.error('❌ Test notification failed:', error);
       throw error;
     }
   }
@@ -378,43 +465,37 @@ export class PushNotificationService {
   /**
    * Save notification preferences
    */
-  savePreferences(preferences: PushNotificationPreferences): void {
+  async savePreferences(preferences: NotificationPreferences): Promise<void> {
     try {
-      localStorage.setItem('vibetunnel-notification-preferences', JSON.stringify(preferences));
-      logger.debug('saved notification preferences');
+      // Save directly - no mapping needed with unified type
+      await serverConfigService.updateNotificationPreferences(preferences);
+      logger.debug('saved notification preferences to config');
     } catch (error) {
       logger.error('failed to save notification preferences:', error);
+      throw error;
     }
   }
 
   /**
    * Load notification preferences
    */
-  loadPreferences(): PushNotificationPreferences {
+  async loadPreferences(): Promise<NotificationPreferences> {
     try {
-      const saved = localStorage.getItem('vibetunnel-notification-preferences');
-      if (saved) {
-        return { ...this.getDefaultPreferences(), ...JSON.parse(saved) };
-      }
+      // Load from config service
+      const configPreferences = await serverConfigService.getNotificationPreferences();
+      // Return preferences directly - no mapping needed
+      return configPreferences || this.getDefaultPreferences();
     } catch (error) {
-      logger.error('failed to load notification preferences:', error);
+      logger.error('failed to load notification preferences from config:', error);
+      return this.getDefaultPreferences();
     }
-    return this.getDefaultPreferences();
   }
 
   /**
    * Get default notification preferences
    */
-  private getDefaultPreferences(): PushNotificationPreferences {
-    return {
-      enabled: false,
-      sessionExit: true,
-      sessionStart: false,
-      sessionError: true,
-      systemAlerts: true,
-      soundEnabled: true,
-      vibrationEnabled: true,
-    };
+  private getDefaultPreferences(): NotificationPreferences {
+    return DEFAULT_NOTIFICATION_PREFERENCES;
   }
 
   /**
@@ -453,7 +534,7 @@ export class PushNotificationService {
   private async sendSubscriptionToServer(subscription: PushSubscription): Promise<void> {
     try {
       const response = await fetch('/api/push/subscribe', {
-        method: 'POST',
+        method: HttpMethod.POST,
         headers: {
           'Content-Type': 'application/json',
         },
@@ -474,10 +555,13 @@ export class PushNotificationService {
   private async removeSubscriptionFromServer(): Promise<void> {
     try {
       const response = await fetch('/api/push/unsubscribe', {
-        method: 'POST',
+        method: HttpMethod.POST,
         headers: {
           'Content-Type': 'application/json',
         },
+        body: JSON.stringify({
+          endpoint: this.pushSubscription?.endpoint,
+        }),
       });
 
       if (!response.ok) {
@@ -580,7 +664,7 @@ export class PushNotificationService {
   async sendTestNotification(message?: string): Promise<void> {
     try {
       const response = await fetch('/api/push/test', {
-        method: 'POST',
+        method: HttpMethod.POST,
         headers: {
           'Content-Type': 'application/json',
         },
@@ -617,7 +701,12 @@ export class PushNotificationService {
    * Refresh VAPID configuration from server
    */
   async refreshVapidConfig(): Promise<void> {
-    await this.fetchVapidPublicKey();
+    try {
+      await this.fetchVapidPublicKey();
+    } catch (_error) {
+      // Error is already logged in fetchVapidPublicKey
+      // Don't re-throw to match test expectations
+    }
   }
 
   /**

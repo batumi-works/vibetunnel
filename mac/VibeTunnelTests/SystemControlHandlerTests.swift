@@ -27,7 +27,7 @@ struct SystemControlHandlerTests {
 
         // Then
         #expect(response == nil) // Events don't return responses
-        // System ready check removed as variable is write-only
+        #expect(systemReadyCalled) // Verify the callback was called
     }
 
     @MainActor

@@ -33,21 +33,50 @@ export class TestSessionManager {
     }
 
     try {
-      // Create session - use zsh by default to match the form's default
-      await sessionListPage.createNewSession(name, spawnWindow, command || 'zsh');
+      // Create session - use bash by default for CI compatibility
+      await sessionListPage.createNewSession(name, spawnWindow, command || 'bash');
 
       // Get session ID from URL for web sessions
       let sessionId = '';
       if (!spawnWindow) {
         console.log(`Web session created, waiting for navigation to session view...`);
-        await this.page.waitForURL(/\?session=/, { timeout: 10000 });
+        // Increase timeout for CI and add retry logic
+        const timeout = process.env.CI ? 30000 : 15000;
+
+        // Add a small delay to ensure navigation starts
+        await this.page.waitForTimeout(500);
+
+        try {
+          await this.page.waitForURL(/\/session\//, { timeout });
+        } catch (error) {
+          // If waitForURL times out, check if we're already on a session page
+          const currentUrl = this.page.url();
+          if (!currentUrl.includes('/session/')) {
+            // Try to wait for any navigation
+            try {
+              await this.page.waitForLoadState('domcontentloaded', { timeout: 5000 });
+            } catch (_loadError) {
+              // Ignore load state error
+            }
+            const finalUrl = this.page.url();
+            if (!finalUrl.includes('/session/')) {
+              console.error(
+                `Navigation failed. Initial URL: ${currentUrl}, Final URL: ${finalUrl}`
+              );
+              throw error;
+            }
+          }
+          console.log(`Already on session page: ${currentUrl}`);
+        }
         const url = this.page.url();
 
-        if (!url.includes('?session=')) {
+        if (!url.includes('/session/')) {
           throw new Error(`Failed to navigate to session after creation. Current URL: ${url}`);
         }
 
-        sessionId = new URL(url).searchParams.get('session') || '';
+        // Extract session ID from path-based URL
+        const match = url.match(/\/session\/([^/?]+)/);
+        sessionId = match ? match[1] : '';
         if (!sessionId) {
           throw new Error(`No session ID found in URL: ${url}`);
         }
@@ -64,17 +93,8 @@ export class TestSessionManager {
           });
 
         // Additional wait to ensure session is saved to backend
-        await this.page
-          .waitForResponse(
-            (response) => response.url().includes('/api/sessions') && response.status() === 200,
-            { timeout: 5000 }
-          )
-          .catch(() => {
-            console.warn('No session list refresh detected, session might not be fully saved');
-          });
-
-        // Extra wait for file system to flush - critical for CI environments
-        await this.page.waitForTimeout(1000);
+        // Skip this wait since we've already verified the session is created and loaded
+        console.log('Session created and loaded, skipping additional waits');
       }
 
       // Track the session
@@ -149,6 +169,8 @@ export class TestSessionManager {
 
   /**
    * Cleans up all tracked sessions
+   * IMPORTANT: This only cleans up sessions that were explicitly tracked by this manager
+   * It will NOT kill sessions created outside of tests (like the VibeTunnel session running Claude Code)
    */
   async cleanupAllSessions(): Promise<void> {
     if (this.sessions.size === 0) return;
@@ -160,45 +182,9 @@ export class TestSessionManager {
       await this.page.goto('/', { waitUntil: 'domcontentloaded' });
     }
 
-    // For parallel tests, only use individual cleanup to avoid interference
-    // Kill All affects all sessions globally and can interfere with other parallel tests
-    const isParallelMode = process.env.TEST_WORKER_INDEX !== undefined;
-
-    if (!isParallelMode) {
-      // Try bulk cleanup with Kill All button only in non-parallel mode
-      try {
-        const killAllButton = this.page.locator('button:has-text("Kill All")');
-        if (await killAllButton.isVisible({ timeout: 1000 })) {
-          const [dialog] = await Promise.all([
-            this.page.waitForEvent('dialog', { timeout: 5000 }).catch(() => null),
-            killAllButton.click(),
-          ]);
-          if (dialog) {
-            await dialog.accept();
-          }
-
-          // Wait for sessions to be marked as exited
-          await this.page.waitForFunction(
-            () => {
-              const cards = document.querySelectorAll('session-card');
-              return Array.from(cards).every(
-                (card) =>
-                  card.textContent?.toLowerCase().includes('exited') ||
-                  card.textContent?.toLowerCase().includes('exit')
-              );
-            },
-            { timeout: 10000 }
-          );
-
-          this.sessions.clear();
-          return;
-        }
-      } catch (error) {
-        console.log('Bulk cleanup failed, trying individual cleanup:', error);
-      }
-    }
-
-    // Use individual cleanup for parallel tests or as fallback
+    // IMPORTANT: NEVER use Kill All button as it would kill ALL sessions including
+    // the VibeTunnel session that Claude Code is running in!
+    // Always use individual cleanup to only kill sessions we created
     const sessionNames = Array.from(this.sessions.keys());
     for (const sessionName of sessionNames) {
       await this.cleanupSession(sessionName);

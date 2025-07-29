@@ -1,20 +1,71 @@
 /**
  * AsciinemaWriter - Records terminal sessions in asciinema format
  *
- * This class writes terminal output in the standard asciinema cast format
+ * This class writes terminal output in the standard asciinema cast format (v2),
  * which is compatible with asciinema players and the existing web interface.
+ * It handles real-time streaming of terminal data while properly managing:
+ * - UTF-8 encoding and incomplete multi-byte sequences
+ * - ANSI escape sequences preservation
+ * - Buffering and backpressure
+ * - Atomic writes with fsync for durability
+ *
+ * Key features:
+ * - Real-time recording with minimal buffering
+ * - Proper handling of escape sequences across buffer boundaries
+ * - Support for all asciinema event types (output, input, resize, markers)
+ * - Automatic directory creation and file management
+ * - Thread-safe write queue for concurrent operations
+ *
+ * @example
+ * ```typescript
+ * // Create a writer for a new recording
+ * const writer = AsciinemaWriter.create(
+ *   '/path/to/recording.cast',
+ *   80,  // terminal width
+ *   24,  // terminal height
+ *   'npm test',  // command being recorded
+ *   'Test Run Recording'  // title
+ * );
+ *
+ * // Write terminal output
+ * writer.writeOutput(Buffer.from('Hello, world!\r\n'));
+ *
+ * // Record user input
+ * writer.writeInput('ls -la');
+ *
+ * // Handle terminal resize
+ * writer.writeResize(120, 40);
+ *
+ * // Add a bookmark/marker
+ * writer.writeMarker('Test started');
+ *
+ * // Close the recording when done
+ * await writer.close();
+ * ```
  */
 
 import { once } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
-import { createLogger } from '../utils/logger.js';
+import { createLogger, isDebugEnabled } from '../utils/logger.js';
+import {
+  calculateSequenceBytePosition,
+  detectLastPruningSequence,
+  logPruningDetection,
+} from '../utils/pruning-detector.js';
 import { WriteQueue } from '../utils/write-queue.js';
 import { type AsciinemaEvent, type AsciinemaHeader, PtyError } from './types.js';
 
 const _logger = createLogger('AsciinemaWriter');
 const fsync = promisify(fs.fsync);
+
+// Type for pruning sequence callback
+export type PruningCallback = (info: {
+  sequence: string;
+  position: number;
+  timestamp: number;
+}) => void;
 
 export class AsciinemaWriter {
   private writeStream: fs.WriteStream;
@@ -23,6 +74,17 @@ export class AsciinemaWriter {
   private headerWritten = false;
   private fd: number | null = null;
   private writeQueue = new WriteQueue();
+
+  // Byte position tracking
+  private bytesWritten: number = 0; // Bytes actually written to disk
+  private pendingBytes: number = 0; // Bytes queued but not yet written
+
+  // Pruning sequence detection callback
+  private pruningCallback?: PruningCallback;
+
+  // Validation tracking
+  private lastValidatedPosition: number = 0;
+  private validationErrors: number = 0;
 
   constructor(
     private filePath: string,
@@ -76,6 +138,26 @@ export class AsciinemaWriter {
   }
 
   /**
+   * Get the current byte position in the file
+   * @returns Object with current position and pending bytes
+   */
+  getPosition(): { written: number; pending: number; total: number } {
+    return {
+      written: this.bytesWritten, // Bytes actually written to disk
+      pending: this.pendingBytes, // Bytes in queue
+      total: this.bytesWritten + this.pendingBytes, // Total position after queue flush
+    };
+  }
+
+  /**
+   * Set a callback to be notified when pruning sequences are detected
+   * @param callback Function called with sequence info and byte position
+   */
+  onPruningSequence(callback: PruningCallback): void {
+    this.pruningCallback = callback;
+  }
+
+  /**
    * Write the asciinema header to the file
    */
   private writeHeader(): void {
@@ -83,10 +165,20 @@ export class AsciinemaWriter {
 
     this.writeQueue.enqueue(async () => {
       const headerJson = JSON.stringify(this.header);
-      const canWrite = this.writeStream.write(`${headerJson}\n`);
+      const headerLine = `${headerJson}\n`;
+      const headerBytes = Buffer.from(headerLine, 'utf8').length;
+
+      // Track pending bytes before write
+      this.pendingBytes += headerBytes;
+
+      const canWrite = this.writeStream.write(headerLine);
       if (!canWrite) {
         await once(this.writeStream, 'drain');
       }
+
+      // Move bytes from pending to written
+      this.bytesWritten += headerBytes;
+      this.pendingBytes -= headerBytes;
     });
     this.headerWritten = true;
   }
@@ -105,12 +197,80 @@ export class AsciinemaWriter {
       const { processedData, remainingBuffer } = this.processTerminalData(combinedBuffer);
 
       if (processedData.length > 0) {
+        // First, check for pruning sequences in the data
+        let pruningInfo: { sequence: string; index: number } | null = null;
+
+        if (this.pruningCallback) {
+          // Use shared detector to find pruning sequences
+          const detection = detectLastPruningSequence(processedData);
+
+          if (detection) {
+            pruningInfo = detection;
+            _logger.debug(
+              `Found pruning sequence '${detection.sequence.split('\x1b').join('\\x1b')}' ` +
+                `at string index ${detection.index} in output data`
+            );
+          }
+        }
+
+        // Create the event with ALL data (not truncated)
         const event: AsciinemaEvent = {
           time,
           type: 'o',
           data: processedData,
         };
+
+        // Calculate the byte position where the event will start
+        const eventStartPos = this.bytesWritten + this.pendingBytes;
+
+        // Write the event
         await this.writeEvent(event);
+
+        // Now that the write is complete, handle pruning callback if needed
+        if (pruningInfo && this.pruningCallback) {
+          // Use shared calculator for exact byte position
+          const exactSequenceEndPos = calculateSequenceBytePosition(
+            eventStartPos,
+            time,
+            processedData,
+            pruningInfo.index,
+            pruningInfo.sequence.length
+          );
+
+          // Validate the calculation
+          const eventJson = `${JSON.stringify([time, 'o', processedData])}\n`;
+          const totalEventSize = Buffer.from(eventJson, 'utf8').length;
+          const calculatedEventEndPos = eventStartPos + totalEventSize;
+
+          if (isDebugEnabled()) {
+            _logger.debug(
+              `Pruning sequence byte calculation:\n` +
+                `  Event start position: ${eventStartPos}\n` +
+                `  Event total size: ${totalEventSize} bytes\n` +
+                `  Event end position: ${calculatedEventEndPos}\n` +
+                `  Exact sequence position: ${exactSequenceEndPos}\n` +
+                `  Current file position: ${this.bytesWritten}`
+            );
+          }
+
+          // Sanity check: sequence position should be within the event
+          if (exactSequenceEndPos > calculatedEventEndPos) {
+            _logger.error(
+              `Pruning sequence position calculation error: ` +
+                `sequence position ${exactSequenceEndPos} is beyond event end ${calculatedEventEndPos}`
+            );
+          } else {
+            // Call the callback with the exact position
+            this.pruningCallback({
+              sequence: pruningInfo.sequence,
+              position: exactSequenceEndPos,
+              timestamp: time,
+            });
+
+            // Use shared logging function
+            logPruningDetection(pruningInfo.sequence, exactSequenceEndPos, '(real-time)');
+          }
+        }
       }
 
       // Store any remaining incomplete data for next time
@@ -169,10 +329,20 @@ export class AsciinemaWriter {
   writeRawJson(jsonValue: unknown): void {
     this.writeQueue.enqueue(async () => {
       const jsonString = JSON.stringify(jsonValue);
-      const canWrite = this.writeStream.write(`${jsonString}\n`);
+      const jsonLine = `${jsonString}\n`;
+      const jsonBytes = Buffer.from(jsonLine, 'utf8').length;
+
+      // Track pending bytes before write
+      this.pendingBytes += jsonBytes;
+
+      const canWrite = this.writeStream.write(jsonLine);
       if (!canWrite) {
         await once(this.writeStream, 'drain');
       }
+
+      // Move bytes from pending to written
+      this.bytesWritten += jsonBytes;
+      this.pendingBytes -= jsonBytes;
     });
   }
 
@@ -183,11 +353,36 @@ export class AsciinemaWriter {
     // Asciinema format: [time, type, data]
     const eventArray = [event.time, event.type, event.data];
     const eventJson = JSON.stringify(eventArray);
+    const eventLine = `${eventJson}\n`;
+    const eventBytes = Buffer.from(eventLine, 'utf8').length;
+
+    // Log detailed write information for debugging
+    if (event.type === 'o' && isDebugEnabled()) {
+      _logger.debug(
+        `Writing output event: ${eventBytes} bytes, ` +
+          `data length: ${event.data.length} chars, ` +
+          `position: ${this.bytesWritten + this.pendingBytes}`
+      );
+    }
+
+    // Track pending bytes before write
+    this.pendingBytes += eventBytes;
 
     // Write and handle backpressure
-    const canWrite = this.writeStream.write(`${eventJson}\n`);
+    const canWrite = this.writeStream.write(eventLine);
     if (!canWrite) {
+      _logger.debug('Write stream backpressure detected, waiting for drain');
       await once(this.writeStream, 'drain');
+    }
+
+    // Move bytes from pending to written
+    this.bytesWritten += eventBytes;
+    this.pendingBytes -= eventBytes;
+
+    // Validate position periodically
+    if (this.bytesWritten - this.lastValidatedPosition > 1024 * 1024) {
+      // Every 1MB
+      await this.validateFilePosition();
     }
 
     // Sync to disk asynchronously
@@ -381,6 +576,44 @@ export class AsciinemaWriter {
    */
   private getElapsedTime(): number {
     return (Date.now() - this.startTime.getTime()) / 1000;
+  }
+
+  /**
+   * Validate that our tracked position matches the actual file size
+   */
+  private async validateFilePosition(): Promise<void> {
+    try {
+      const stats = await fs.promises.stat(this.filePath);
+      const actualSize = stats.size;
+      const expectedSize = this.bytesWritten;
+
+      if (actualSize !== expectedSize) {
+        this.validationErrors++;
+        _logger.error(
+          `AsciinemaWriter position mismatch! ` +
+            `Expected: ${expectedSize} bytes, Actual: ${actualSize} bytes, ` +
+            `Difference: ${actualSize - expectedSize} bytes, ` +
+            `Validation errors: ${this.validationErrors}`
+        );
+
+        // If the difference is significant, this is a critical error
+        if (Math.abs(actualSize - expectedSize) > 100) {
+          throw new PtyError(
+            `Critical byte position tracking error: expected ${expectedSize}, actual ${actualSize}`,
+            'POSITION_MISMATCH'
+          );
+        }
+      } else {
+        _logger.debug(`Position validation passed: ${actualSize} bytes`);
+      }
+
+      this.lastValidatedPosition = this.bytesWritten;
+    } catch (error) {
+      if (error instanceof PtyError) {
+        throw error;
+      }
+      _logger.error(`Failed to validate file position:`, error);
+    }
   }
 
   /**

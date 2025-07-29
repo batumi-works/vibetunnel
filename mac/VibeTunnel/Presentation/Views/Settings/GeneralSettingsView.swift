@@ -6,51 +6,45 @@ import SwiftUI
 struct GeneralSettingsView: View {
     @AppStorage("autostart")
     private var autostart = false
-    @AppStorage("showNotifications")
-    private var showNotifications = true
     @AppStorage(AppConstants.UserDefaultsKeys.updateChannel)
     private var updateChannelRaw = UpdateChannel.stable.rawValue
     @AppStorage(AppConstants.UserDefaultsKeys.showInDock)
     private var showInDock = true
     @AppStorage(AppConstants.UserDefaultsKeys.preventSleepWhenRunning)
     private var preventSleepWhenRunning = true
-    @StateObject private var configManager = ConfigManager.shared
-    @AppStorage(AppConstants.UserDefaultsKeys.serverPort)
-    private var serverPort = "4020"
-    @AppStorage(AppConstants.UserDefaultsKeys.dashboardAccessMode)
-    private var accessModeString = AppConstants.Defaults.dashboardAccessMode
+
+    @Environment(ConfigManager.self) private var configManager
+    @Environment(SystemPermissionManager.self) private var permissionManager
 
     @State private var isCheckingForUpdates = false
-    @State private var localIPAddress: String?
-
-    @Environment(ServerManager.self)
-    private var serverManager
+    @State private var permissionUpdateTrigger = 0
 
     private let startupManager = StartupManager()
-    private let logger = Logger(subsystem: "sh.vibetunnel.vibetunnel", category: "GeneralSettings")
-
-    private var accessMode: DashboardAccessMode {
-        DashboardAccessMode(rawValue: accessModeString) ?? .localhost
-    }
+    private let logger = Logger(subsystem: BundleIdentifiers.loggerSubsystem, category: "GeneralSettings")
 
     var updateChannel: UpdateChannel {
         UpdateChannel(rawValue: updateChannelRaw) ?? .stable
     }
 
+    // MARK: - Helper Properties
+
+    // IMPORTANT: These computed properties ensure the UI always shows current permission state.
+    // The permissionUpdateTrigger dependency forces SwiftUI to re-evaluate these properties
+    // when permissions change. Without this, the UI would not update when permissions are
+    // granted in System Settings while this view is visible.
+    private var hasAppleScriptPermission: Bool {
+        _ = permissionUpdateTrigger
+        return permissionManager.hasPermission(.appleScript)
+    }
+
+    private var hasAccessibilityPermission: Bool {
+        _ = permissionUpdateTrigger
+        return permissionManager.hasPermission(.accessibility)
+    }
+
     var body: some View {
         NavigationStack {
             Form {
-                // Server Configuration section
-                ServerConfigurationSection(
-                    accessMode: accessMode,
-                    accessModeString: $accessModeString,
-                    serverPort: $serverPort,
-                    localIPAddress: localIPAddress,
-                    restartServerWithNewBindAddress: restartServerWithNewBindAddress,
-                    restartServerWithNewPort: restartServerWithNewPort,
-                    serverManager: serverManager
-                )
-
                 // CLI Installation section
                 CLIInstallationSection()
 
@@ -93,6 +87,13 @@ struct GeneralSettingsView: View {
                     Text("Application")
                         .font(.headline)
                 }
+
+                // System Permissions section (moved from Security)
+                PermissionsSection(
+                    hasAppleScriptPermission: hasAppleScriptPermission,
+                    hasAccessibilityPermission: hasAccessibilityPermission,
+                    permissionManager: permissionManager
+                )
             }
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
@@ -101,12 +102,19 @@ struct GeneralSettingsView: View {
         .task {
             // Sync launch at login status
             autostart = startupManager.isLaunchAtLoginEnabled
-
-            // Update local IP address
-            updateLocalIPAddress()
+            // Check permissions before first render to avoid UI flashing
+            await permissionManager.checkAllPermissions()
         }
         .onAppear {
-            updateLocalIPAddress()
+            // Register for continuous monitoring
+            permissionManager.registerForMonitoring()
+        }
+        .onDisappear {
+            permissionManager.unregisterFromMonitoring()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .permissionsUpdated)) { _ in
+            // Increment trigger to force computed property re-evaluation
+            permissionUpdateTrigger += 1
         }
     }
 
@@ -154,27 +162,6 @@ struct GeneralSettingsView: View {
         Task {
             try? await Task.sleep(for: .seconds(2))
             isCheckingForUpdates = false
-        }
-    }
-
-    private func restartServerWithNewPort(_ port: Int) {
-        Task {
-            await ServerConfigurationHelpers.restartServerWithNewPort(port, serverManager: serverManager)
-        }
-    }
-
-    private func restartServerWithNewBindAddress() {
-        Task {
-            await ServerConfigurationHelpers.restartServerWithNewBindAddress(
-                accessMode: accessMode,
-                serverManager: serverManager
-            )
-        }
-    }
-
-    private func updateLocalIPAddress() {
-        Task {
-            localIPAddress = await ServerConfigurationHelpers.updateLocalIPAddress(accessMode: accessMode)
         }
     }
 }

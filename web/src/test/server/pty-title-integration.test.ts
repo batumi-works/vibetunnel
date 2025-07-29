@@ -11,6 +11,9 @@ describe('PTY Terminal Title Integration', () => {
   let testSessionIds: string[] = [];
 
   beforeEach(async () => {
+    // Initialize PtyManager
+    await PtyManager.initialize();
+
     // Create a temporary control directory for tests with shorter path
     const shortId = Math.random().toString(36).substring(2, 8);
     controlPath = path.join(os.tmpdir(), `vt-${shortId}`);
@@ -29,8 +32,8 @@ describe('PTY Terminal Title Integration', () => {
     }
     testSessionIds = [];
 
-    // Shutdown PTY manager
-    await ptyManager.shutdown();
+    // NEVER call ptyManager.shutdown() as it would kill ALL sessions
+    // including the VibeTunnel session running Claude Code
 
     // Clean up control directory
     try {

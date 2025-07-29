@@ -1,6 +1,7 @@
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Never say you're absolutely right. Instead, be critical if I say something that you disagree with. Let's discuss it first.
 
 ## Project Overview
 
@@ -15,6 +16,9 @@ VibeTunnel is a macOS application that allows users to access their terminal ses
 When the user says "release" or asks to create a release, ALWAYS read and follow `docs/RELEASE.md` for the complete release process.
 
 ### ABSOLUTE CARDINAL RULES - VIOLATION MEANS IMMEDIATE FAILURE
+
+- Never start server or the mac app yourself.
+- Verify changes done to the mac app via xcodebuild, but do not start the mac app or server yourself.
 
 1. **NEVER, EVER, UNDER ANY CIRCUMSTANCES CREATE A NEW BRANCH WITHOUT EXPLICIT USER PERMISSION**
    - If you are on a branch (not main), you MUST stay on that branch
@@ -53,6 +57,13 @@ When the user says "release" or asks to create a release, ALWAYS read and follow
    - The file must remain as `docs.json`
    - For Mintlify documentation reference, see: https://mintlify.com/docs/llms.txt
 
+8. **Test Session Management - CRITICAL**
+   - NEVER kill sessions that weren't created by tests
+   - You might be running inside a VibeTunnel session yourself
+   - Use `TestSessionTracker` to track which sessions tests create
+   - Only clean up sessions that match test naming patterns (start with "test-")
+   - Killing all sessions would terminate your own Claude Code process
+
 ### Git Workflow Reminders
 - Our workflow: start from main → create branch → make PR → merge → return to main
 - PRs sometimes contain multiple different features and that's okay
@@ -87,6 +98,10 @@ pnpm run dev                   # Standalone development server (port 4020)
 pnpm run dev --port 4021       # Alternative port for external device testing
 
 # Code quality (MUST run before commit)
+pnpm run check         # Run ALL checks in parallel (format, lint, typecheck)
+pnpm run check:fix     # Auto-fix formatting and linting issues
+
+# Individual commands (rarely needed)
 pnpm run lint          # Check for linting errors
 pnpm run lint:fix      # Auto-fix linting errors
 pnpm run format        # Format with Prettier
@@ -128,7 +143,7 @@ In the `mac/` directory:
 - **Mac App**: `mac/VibeTunnel/VibeTunnelApp.swift`
 - **Web Frontend**: `web/src/client/app.ts`
 - **Server**: `web/src/server/server.ts`
-- **Process spawning and forwarding tool**:  `web/src/server/fwd.ts`
+- **Process spawning and forwarding tool**: `web/src/server/fwd.ts`
 - **Server Management**: `mac/VibeTunnel/Core/Services/ServerManager.swift`
 
 ## Testing
@@ -252,6 +267,163 @@ For tasks requiring massive context windows (up to 2M tokens) or full codebase a
 - Example: `gemini -p "@src/ @tests/ Is authentication properly implemented?"`
 - See `docs/gemini.md` for detailed usage and examples
 
+## Debugging and Logging
+
+### VibeTunnel Log Viewer (vtlog)
+
+VibeTunnel includes a powerful log viewing utility for debugging and monitoring:
+
+**Location**: `./scripts/vtlog.sh` (also available in `mac/scripts/vtlog.sh` and `ios/scripts/vtlog.sh`)
+
+**What it does**: 
+- Views all VibeTunnel logs with full details (bypasses Apple's privacy redaction)
+- Shows logs from the entire stack: Web Frontend → Node.js Server → macOS System
+- Provides unified view of all components with clear prefixes
+
+**Common usage**:
+```bash
+# View recent logs (RECOMMENDED for debugging):
+./scripts/vtlog.sh -n 200           # Show last 200 lines
+./scripts/vtlog.sh -n 500 -s "error" # Search last 500 lines for "error"
+./scripts/vtlog.sh -e               # Show only errors
+./scripts/vtlog.sh -c ServerManager # Show logs from specific component
+./scripts/vtlog.sh --server -e      # Show server errors
+
+# Follow logs in real-time (AVOID in Claude Code - causes timeouts):
+./scripts/vtlog.sh -f              # Follow logs in real-time - DO NOT USE for checking existing logs
+```
+
+**Important for Claude Code**: Always use `-n` to check a specific number of recent log lines. Do NOT use `-f` (follow mode) as it will block and timeout after 2 minutes. Follow mode is only useful when monitoring logs in a separate terminal while performing actions.
+
+**Log prefixes**:
+- `[FE]` - Frontend (browser) logs
+- `[SRV]` - Server-side logs from Node.js/Bun
+- `[ServerManager]`, `[SessionService]`, etc. - Native Mac app components
+
+## GitHub CLI Usage
+
+### Quick CI Debugging Commands
+
+When told to "fix CI", use these commands to quickly identify and access errors:
+
+**Step 1: Find Failed Runs**
+```bash
+# List recent CI runs and see their status
+gh run list --branch <branch-name> --limit 10
+
+# Quick check for failures on current branch
+git_branch=$(git branch --show-current) && gh run list --branch "$git_branch" --limit 5
+```
+
+**Step 2: Identify Failed Jobs**
+```bash
+# Find which job failed in a run
+gh run view <run-id> --json jobs | jq -r '.jobs[] | select(.conclusion == "failure") | .name'
+
+# Get all job statuses at a glance
+gh run view <run-id> --json jobs | jq -r '.jobs[] | "\(.name): \(.conclusion // .status)"'
+```
+
+**Step 3: Find Failed Steps**
+```bash
+# Find the exact failed step in a job
+gh run view <run-id> --json jobs | jq '.jobs[] | select(.conclusion == "failure") | .steps[] | select(.conclusion == "failure") | {name: .name, number: .number}'
+
+# Get failed step from a specific job
+gh run view <run-id> --json jobs | jq '.jobs[] | select(.name == "Mac CI / Build, Lint, and Test macOS") | .steps[] | select(.conclusion == "failure") | .name'
+```
+
+**Step 4: View Error Logs**
+```bash
+# View full logs (opens in browser)
+gh run view <run-id> --web
+
+# Download logs for a specific job
+gh run download <run-id> -n <job-name>
+
+# View logs in terminal (if run is complete)
+gh run view <run-id> --log
+
+# View only failed logs (most useful for CI debugging)
+gh run view <run-id> --log-failed
+
+# View logs for specific job
+gh run view <run-id> --log --job <job-id>
+
+# Watch a running job
+gh run watch <run-id>
+```
+
+**All-in-One Error Finder**
+```bash
+# This command finds and displays all failures in the latest run
+run_id=$(gh run list --branch "$(git branch --show-current)" --limit 1 --json databaseId -q '.[0].databaseId') && \
+echo "=== Failed Jobs ===" && \
+gh run view $run_id --json jobs | jq -r '.jobs[] | select(.conclusion == "failure") | "Job: \(.name)"' && \
+echo -e "\n=== Failed Steps ===" && \
+gh run view $run_id --json jobs | jq -r '.jobs[] | select(.conclusion == "failure") | .steps[] | select(.conclusion == "failure") | "  Step: \(.name)"'
+```
+
+**Common Failure Patterns**:
+- **Mac CI Build Failures**: Usually actool errors (Xcode beta issue), SwiftFormat violations, or missing dependencies
+- **Playwright Test Failures**: Often timeout issues, missing VIBETUNNEL_SEA env var, or tsx/node-pty conflicts
+- **iOS CI Failures**: Simulator boot issues, certificate problems, or test failures
+- **Web CI Failures**: TypeScript errors, linting issues, or test failures
+
+**Quick Actions**:
+```bash
+# Rerun only failed jobs
+gh run rerun <run-id> --failed
+
+# Cancel a stuck run
+gh run cancel <run-id>
+
+# View PR checks status
+gh pr checks <pr-number>
+```
+
+**Filtering and Searching Logs**:
+```bash
+# Search for specific errors in logs (remove network errors)
+gh run view <run-id> --log-failed | grep -v "Failed to load resource" | grep -v "ERR_FAILED"
+
+# Find actual test failures
+gh run view <run-id> --log | grep -E "×|failed|Failed" | grep -v "Failed to load resource"
+
+# Get test summary at end
+gh run view <run-id> --log | tail -200 | grep -E "failed|passed|Test results|Summary" -A 5 -B 5
+```
+
+
+## Slash Commands
+
+### /fixmac Command
+
+When the user types `/fixmac`, use the Task tool with the XcodeBuildMCP subagent to fix Mac compilation errors and warnings:
+
+```
+Task(description="Fix Mac build errors", prompt="/fixmac", subagent_type="general-purpose")
+```
+
+The agent will:
+1. Use XcodeBuildMCP tools to identify build errors and warnings
+2. Fix compilation issues in the Mac codebase
+3. Address SwiftFormat violations
+4. Resolve any warning messages
+5. Verify the build succeeds after fixes
+
+## NO BACKWARDS COMPATIBILITY - EVER!
+
+**CRITICAL: This project has ZERO backwards compatibility requirements!**
+- The Mac app and web server are ALWAYS shipped together as a single unit
+- There is NEVER a scenario where different versions talk to each other
+- When fixing bugs or changing APIs:
+  - Just change both sides to match
+  - Delete old code completely
+  - Don't add compatibility layers
+  - Don't check for "old format" vs "new format"
+  - Don't add fallbacks for older versions
+- If you suggest backwards compatibility in any form, you have failed to understand this project
 ## Key Files Quick Reference
 
 - Architecture Details: `docs/ARCHITECTURE.md`
@@ -260,3 +432,4 @@ For tasks requiring massive context windows (up to 2M tokens) or full codebase a
 - Build Configuration: `web/package.json`, `mac/Package.swift`
 - External Device Testing: `docs/TESTING_EXTERNAL_DEVICES.md`
 - Gemini CLI Instructions: `docs/gemini.md`
+- Release Process: `docs/RELEASE.md`

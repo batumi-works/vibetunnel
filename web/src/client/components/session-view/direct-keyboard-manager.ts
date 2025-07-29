@@ -50,20 +50,26 @@ export interface DirectKeyboardCallbacks {
 export class DirectKeyboardManager {
   private hiddenInput: HTMLInputElement | null = null;
   private focusRetentionInterval: number | null = null;
-  private instanceId: string;
   private inputManager: InputManager | null = null;
   private sessionViewElement: HTMLElement | null = null;
   private callbacks: DirectKeyboardCallbacks | null = null;
   private showQuickKeys = false;
-  private hiddenInputFocused = false;
   private keyboardMode = false; // Track whether we're in keyboard mode
-  private keyboardModeTimestamp = 0; // Track when we entered keyboard mode
   private keyboardActivationTimeout: number | null = null;
   private captureClickHandler: ((e: Event) => void) | null = null;
   private globalPasteHandler: ((e: Event) => void) | null = null;
 
   // IME composition state tracking for Japanese/CJK input
   private isComposing = false;
+
+  // Instance management
+  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: Used in constructor
+  private instanceId: string;
+  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: Used for focus state management
+  private hiddenInputFocused = false;
+  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: Used for keyboard mode timing
+  private keyboardModeTimestamp = 0;
+  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: Used for IME composition
   private compositionBuffer = '';
 
   constructor(instanceId: string) {
@@ -198,9 +204,19 @@ export class DirectKeyboardManager {
       // Focus synchronously - critical for iOS Safari
       this.hiddenInput.focus();
 
-      // Also click synchronously to help trigger keyboard
-      this.hiddenInput.click();
-      logger.log('Focused and clicked hidden input synchronously');
+      // Set a dummy value and select it to help trigger iOS keyboard
+      // This helps iOS recognize that we want to show the keyboard
+      this.hiddenInput.value = ' ';
+      this.hiddenInput.setSelectionRange(0, 1);
+
+      // Clear the dummy value after a short delay
+      setTimeout(() => {
+        if (this.hiddenInput) {
+          this.hiddenInput.value = '';
+        }
+      }, 50);
+
+      logger.log('Focused hidden input with dummy value trick');
     }
   }
 

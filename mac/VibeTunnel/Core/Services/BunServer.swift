@@ -36,8 +36,8 @@ final class BunServer {
     /// Resource cleanup tracking
     private var isCleaningUp = false
 
-    private let logger = Logger(subsystem: BundleIdentifiers.main, category: "BunServer")
-    private let serverOutput = Logger(subsystem: BundleIdentifiers.main, category: "ServerOutput")
+    private let logger = Logger(subsystem: BundleIdentifiers.loggerSubsystem, category: "BunServer")
+    private let serverOutput = Logger(subsystem: BundleIdentifiers.loggerSubsystem, category: "ServerOutput")
 
     var isRunning: Bool {
         state == .running
@@ -46,6 +46,11 @@ final class BunServer {
     var port: String = ""
 
     var bindAddress: String = "127.0.0.1"
+
+    /// The process identifier of the running server, if available
+    var processIdentifier: Int32? {
+        process?.processIdentifier
+    }
 
     /// Local authentication token for bypassing auth on localhost
     private let localAuthToken: String = {
@@ -60,11 +65,16 @@ final class BunServer {
     /// Get the local auth token for use in HTTP requests
     var localToken: String? {
         // Check if authentication is disabled
-        let authConfig = AppConstants.AuthConfig.current()
+        let authConfig = AuthConfig.current()
         if authConfig.mode == "none" {
             return nil
         }
         return localAuthToken
+    }
+
+    /// Get the current authentication mode
+    var authMode: String {
+        AuthConfig.current().mode
     }
 
     // MARK: - Initialization
@@ -102,7 +112,7 @@ final class BunServer {
         }
 
         // Check if we should use dev server
-        let devConfig = AppConstants.DevServerConfig.current()
+        let devConfig = DevServerConfig.current()
 
         if devConfig.useDevServer && !devConfig.devServerPath.isEmpty {
             logger.notice("🔧 Starting DEVELOPMENT SERVER with hot reload (pnpm run dev) on port \(self.port)")
@@ -191,7 +201,7 @@ final class BunServer {
         var vibetunnelArgs = ["--port", String(port), "--bind", bindAddress]
 
         // Add authentication flags based on configuration
-        let authConfig = AppConstants.AuthConfig.current()
+        let authConfig = AuthConfig.current()
         logger.info("Configuring authentication mode: \(authConfig.mode)")
 
         switch authConfig.mode {
@@ -402,7 +412,7 @@ final class BunServer {
         logger.info("Dev server working directory: \(expandedPath)")
 
         // Get authentication mode
-        let authConfig = AppConstants.AuthConfig.current()
+        let authConfig = AuthConfig.current()
 
         // Build the dev server arguments
         let devArgs = devServerManager.buildDevServerArguments(
@@ -700,7 +710,7 @@ final class BunServer {
             let handle = pipe.fileHandleForReading
             let source = DispatchSource.makeReadSource(fileDescriptor: handle.fileDescriptor)
 
-            let logger = Logger(subsystem: "sh.vibetunnel.vibetunnel", category: "BunServer")
+            let logger = Logger(subsystem: BundleIdentifiers.loggerSubsystem, category: "BunServer")
             logger.debug("Starting stdout monitoring for Bun server on port \(currentPort)")
 
             // Create a cancellation handler
@@ -779,7 +789,7 @@ final class BunServer {
             let handle = pipe.fileHandleForReading
             let source = DispatchSource.makeReadSource(fileDescriptor: handle.fileDescriptor)
 
-            let logger = Logger(subsystem: "sh.vibetunnel.vibetunnel", category: "BunServer")
+            let logger = Logger(subsystem: BundleIdentifiers.loggerSubsystem, category: "BunServer")
             logger.debug("Starting stderr monitoring for Bun server on port \(currentPort)")
 
             // Create a cancellation handler
@@ -908,7 +918,7 @@ final class BunServer {
 
         if wasRunning {
             // Unexpected termination
-            let devConfig = AppConstants.DevServerConfig.current()
+            let devConfig = DevServerConfig.current()
             let serverType = devConfig.useDevServer ? "Development server (pnpm run dev)" : "Production server"
 
             self.logger.error("\(serverType) terminated unexpectedly with exit code: \(exitCode)")
@@ -928,7 +938,7 @@ final class BunServer {
             }
         } else {
             // Normal termination
-            let devConfig = AppConstants.DevServerConfig.current()
+            let devConfig = DevServerConfig.current()
             let serverType = devConfig.useDevServer ? "Development server" : "Production server"
             self.logger.info("\(serverType) terminated normally with exit code: \(exitCode)")
         }
@@ -1010,7 +1020,7 @@ extension BunServer {
 
 /// A sendable log handler for use in detached tasks
 private final class LogHandler: Sendable {
-    private let serverOutput = Logger(subsystem: "sh.vibetunnel.vibetunnel", category: "ServerOutput")
+    private let serverOutput = Logger(subsystem: BundleIdentifiers.loggerSubsystem, category: "ServerOutput")
 
     func log(_ line: String, isError: Bool) {
         let lowercased = line.lowercased()

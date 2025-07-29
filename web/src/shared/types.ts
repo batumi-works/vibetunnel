@@ -3,6 +3,53 @@
  */
 
 /**
+ * HTTP methods enum
+ */
+export enum HttpMethod {
+  GET = 'GET',
+  POST = 'POST',
+  PUT = 'PUT',
+  DELETE = 'DELETE',
+  PATCH = 'PATCH',
+  HEAD = 'HEAD',
+  OPTIONS = 'OPTIONS',
+}
+
+/**
+ * Types of server events that can be received via Server-Sent Events (SSE).
+ * Matches the Swift ServerEventType enum for type safety across platforms.
+ */
+export enum ServerEventType {
+  SessionStart = 'session-start',
+  SessionExit = 'session-exit',
+  CommandFinished = 'command-finished',
+  CommandError = 'command-error',
+  Bell = 'bell',
+  ClaudeTurn = 'claude-turn',
+  Connected = 'connected',
+  TestNotification = 'test-notification',
+}
+
+/**
+ * Server event received via Server-Sent Events (SSE).
+ * Matches the Swift ServerEvent struct for cross-platform compatibility.
+ */
+export interface ServerEvent {
+  type: ServerEventType;
+  sessionId?: string;
+  sessionName?: string;
+  command?: string;
+  exitCode?: number;
+  duration?: number;
+  processInfo?: string;
+  message?: string;
+  timestamp: string; // ISO 8601 format
+  // Test notification specific fields
+  title?: string;
+  body?: string;
+}
+
+/**
  * Session status enum
  */
 export type SessionStatus = 'starting' | 'running' | 'exited';
@@ -28,6 +75,25 @@ export interface SessionInfo {
    */
   lastClearOffset?: number;
   version?: string; // VibeTunnel version that created this session
+  gitRepoPath?: string; // Repository root path
+  gitBranch?: string; // Current branch name
+  gitAheadCount?: number; // Commits ahead of upstream
+  gitBehindCount?: number; // Commits behind upstream
+  gitHasChanges?: boolean; // Has uncommitted changes
+  gitIsWorktree?: boolean; // Is a worktree (not main repo)
+  gitMainRepoPath?: string; // Main repository path (same as gitRepoPath if not worktree)
+  // Git status details (not persisted to disk, fetched dynamically)
+  gitModifiedCount?: number; // Number of modified files
+  gitUntrackedCount?: number; // Number of untracked files
+  gitStagedCount?: number; // Number of staged files
+  gitAddedCount?: number; // Number of added files
+  gitDeletedCount?: number; // Number of deleted files
+  /**
+   * Whether this session was spawned from within VibeTunnel itself.
+   * Used to distinguish between direct terminal sessions and nested VibeTunnel sessions.
+   * Sessions with attachedViaVT=true are spawned from within an existing VibeTunnel session.
+   */
+  attachedViaVT?: boolean;
 }
 
 /**
@@ -87,6 +153,13 @@ export interface SessionCreateOptions {
   cols?: number;
   rows?: number;
   titleMode?: TitleMode;
+  gitRepoPath?: string;
+  gitBranch?: string;
+  gitAheadCount?: number;
+  gitBehindCount?: number;
+  gitHasChanges?: boolean;
+  gitIsWorktree?: boolean;
+  gitMainRepoPath?: string;
 }
 
 /**
@@ -160,9 +233,11 @@ export interface PushNotificationPreferences {
   sessionExit: boolean;
   sessionStart: boolean;
   sessionError: boolean;
+  commandNotifications: boolean;
   systemAlerts: boolean;
   soundEnabled: boolean;
   vibrationEnabled: boolean;
+  claudeTurn?: boolean;
 }
 
 /**

@@ -31,7 +31,7 @@ async function globalSetup(config: FullConfig) {
   // Set up any global test data or configuration
   process.env.PLAYWRIGHT_TEST_BASE_URL = config.use?.baseURL || testConfig.baseURL;
 
-  // Clean up old test sessions if requested
+  // Clean up sessions if explicitly requested
   if (process.env.CLEAN_TEST_SESSIONS === 'true') {
     console.log('Cleaning up old test sessions...');
     const browser = await chromium.launch({ headless: true });
@@ -56,27 +56,48 @@ async function globalSetup(config: FullConfig) {
 
       console.log(`Found ${sessions.length} sessions`);
 
-      // Filter test sessions (older than 1 hour)
-      const oneHourAgo = Date.now() - 60 * 60 * 1000;
-      const testSessions = sessions.filter((s: Session) => {
-        const isTestSession =
-          s.name?.includes('test-') ||
-          s.name?.includes('nav-test') ||
-          s.name?.includes('keyboard-test');
-        const isOld = new Date(s.startedAt).getTime() < oneHourAgo;
-        return isTestSession && isOld;
-      });
+      if (process.env.CI && process.env.FORCE_CLEAN_ALL_SESSIONS === 'true') {
+        // On CI: Only clean ALL sessions if explicitly forced
+        console.log('FORCE_CLEAN_ALL_SESSIONS enabled - removing ALL sessions');
 
-      console.log(`Found ${testSessions.length} old test sessions to clean up`);
+        for (const session of sessions) {
+          try {
+            await page.evaluate(async (sessionId) => {
+              await fetch(`/api/sessions/${sessionId}`, { method: 'DELETE' });
+            }, session.id);
+          } catch (error) {
+            console.log(`Failed to kill session ${session.id}:`, error);
+          }
+        }
 
-      // Kill old test sessions
-      for (const session of testSessions) {
-        try {
-          await page.evaluate(async (sessionId) => {
-            await fetch(`/api/sessions/${sessionId}`, { method: 'DELETE' });
-          }, session.id);
-        } catch (error) {
-          console.log(`Failed to kill session ${session.id}:`, error);
+        console.log(`Cleaned up all ${sessions.length} sessions`);
+      } else {
+        // Clean up old test sessions (both CI and local)
+        const oneHourAgo = Date.now() - 60 * 60 * 1000;
+        const testSessions = sessions.filter((s: Session) => {
+          const isTestSession =
+            s.name?.includes('test-') ||
+            s.name?.includes('nav-test') ||
+            s.name?.includes('keyboard-test') ||
+            s.name?.includes('sesscreate-') ||
+            s.name?.includes('actmon-') ||
+            s.name?.includes('termint-') ||
+            s.name?.includes('uifeat-');
+          const isOld = new Date(s.startedAt).getTime() < oneHourAgo;
+          return isTestSession && isOld;
+        });
+
+        console.log(`Found ${testSessions.length} old test sessions to clean up`);
+
+        // Kill old test sessions
+        for (const session of testSessions) {
+          try {
+            await page.evaluate(async (sessionId) => {
+              await fetch(`/api/sessions/${sessionId}`, { method: 'DELETE' });
+            }, session.id);
+          } catch (error) {
+            console.log(`Failed to kill session ${session.id}:`, error);
+          }
         }
       }
 

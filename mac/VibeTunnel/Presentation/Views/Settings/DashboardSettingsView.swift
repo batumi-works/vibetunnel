@@ -26,7 +26,7 @@ struct DashboardSettingsView: View {
     @State private var ngrokStatus: NgrokTunnelStatus?
     @State private var tailscaleStatus: (isInstalled: Bool, isRunning: Bool, hostname: String?)?
 
-    private let logger = Logger(subsystem: "sh.vibetunnel.vibetunnel", category: "DashboardSettings")
+    private let logger = Logger(subsystem: BundleIdentifiers.loggerSubsystem, category: "DashboardSettings")
 
     private var accessMode: DashboardAccessMode {
         DashboardAccessMode(rawValue: accessModeString) ?? .localhost
@@ -37,14 +37,9 @@ struct DashboardSettingsView: View {
             Form {
                 ServerStatusSection(
                     serverStatus: serverStatus,
-                    serverPort: serverPort,
-                    accessMode: accessMode,
+                    serverPort: $serverPort,
+                    accessModeString: $accessModeString,
                     serverManager: serverManager
-                )
-
-                ActiveSessionsSection(
-                    activeSessions: activeSessions,
-                    sessionService: sessionService
                 )
 
                 RemoteAccessStatusSection(
@@ -53,6 +48,11 @@ struct DashboardSettingsView: View {
                     cloudflareService: cloudflareService,
                     serverPort: serverPort,
                     accessMode: accessMode
+                )
+
+                ActiveSessionsSection(
+                    activeSessions: activeSessions,
+                    sessionService: sessionService
                 )
             }
             .formStyle(.grouped)
@@ -87,7 +87,7 @@ struct DashboardSettingsView: View {
 
                 return DashboardSessionInfo(
                     id: session.id,
-                    title: session.name ?? "Untitled",
+                    title: session.name.isEmpty ? "Untitled" : session.name,
                     createdAt: createdAt,
                     isActive: session.isRunning
                 )
@@ -128,16 +128,17 @@ private struct DashboardSessionInfo: Identifiable {
     let isActive: Bool
 }
 
-// MARK: - Server Status Section
+// MARK: - Server Configuration Section
 
 private struct ServerStatusSection: View {
     let serverStatus: ServerStatus
-    let serverPort: String
-    let accessMode: DashboardAccessMode
+    @Binding var serverPort: String
+    @Binding var accessModeString: String
     let serverManager: ServerManager
 
     @State private var portConflict: PortConflict?
     @State private var isCheckingPort = false
+    @State private var localIPAddress: String?
 
     private var isServerRunning: Bool {
         serverStatus == .running
@@ -145,6 +146,10 @@ private struct ServerStatusSection: View {
 
     private var serverPortInt: Int {
         Int(serverPort) ?? 4_020
+    }
+
+    private var accessMode: DashboardAccessMode {
+        DashboardAccessMode(rawValue: accessModeString) ?? .localhost
     }
 
     var body: some View {
@@ -179,9 +184,21 @@ private struct ServerStatusSection: View {
                         }
                     }
 
-                    LabeledContent("Port") {
-                        Text(serverPort)
-                    }
+                    // Access Mode
+                    AccessModeView(
+                        accessMode: accessMode,
+                        accessModeString: $accessModeString,
+                        serverPort: serverPort,
+                        localIPAddress: localIPAddress,
+                        restartServerWithNewBindAddress: restartServerWithNewBindAddress
+                    )
+
+                    // Editable Port
+                    PortConfigurationView(
+                        serverPort: $serverPort,
+                        restartServerWithNewPort: restartServerWithNewPort,
+                        serverManager: serverManager
+                    )
 
                     LabeledContent("Bind Address") {
                         Text(serverManager.bindAddress)
@@ -199,40 +216,39 @@ private struct ServerStatusSection: View {
                                 .font(.system(.body, design: .monospaced))
                         }
                     }
+
+                    if let pid = serverManager.serverProcessId {
+                        LabeledContent("Process ID") {
+                            Text("\(pid)")
+                                .font(.system(.body, design: .monospaced))
+                        }
+                    }
                 }
 
                 Divider()
 
-                // Server Status
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text("HTTP Server")
-                            Circle()
-                                .fill(isServerRunning ? .green : .red)
-                                .frame(width: 8, height: 8)
-                        }
-                        Text(isServerRunning ? "Server is running on port \(serverPort)" : "Server is stopped")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                // Server Control
+                LabeledContent("HTTP Server") {
+                    HStack {
+                        Spacer()
 
-                    Spacer()
-
-                    if serverStatus == .stopped {
-                        Button("Start") {
-                            Task {
-                                await serverManager.start()
+                        if serverStatus == .stopped {
+                            Button("Start") {
+                                Task {
+                                    await serverManager.start()
+                                }
                             }
-                        }
-                        .buttonStyle(.borderedProminent)
-                    } else if serverStatus == .running {
-                        Button("Restart") {
-                            Task {
-                                await serverManager.manualRestart()
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        } else if serverStatus == .running {
+                            Button("Restart") {
+                                Task {
+                                    await serverManager.manualRestart()
+                                }
                             }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
                         }
-                        .buttonStyle(.borderedProminent)
                     }
                 }
 
@@ -280,14 +296,76 @@ private struct ServerStatusSection: View {
             .padding(.vertical, 4)
             .task {
                 await checkPortAvailability()
+                await updateLocalIPAddress()
             }
             .task(id: serverPort) {
                 await checkPortAvailability()
             }
+            .task(id: accessModeString) {
+                await updateLocalIPAddress()
+            }
         } header: {
-            Text("Server Status")
+            Text("Server Configuration")
                 .font(.headline)
+        } footer: {
+            // Dashboard URL display
+            if accessMode == .localhost {
+                HStack(spacing: 5) {
+                    Text("Dashboard available at")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    if let url = DashboardURLBuilder.dashboardURL(port: serverPort) {
+                        Link(url.absoluteString, destination: url)
+                            .font(.caption)
+                            .foregroundStyle(.blue)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .multilineTextAlignment(.center)
+            } else if accessMode == .network {
+                if let ip = localIPAddress {
+                    HStack(spacing: 5) {
+                        Text("Dashboard available at")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        if let url = URL(string: "http://\(ip):\(serverPort)") {
+                            Link(url.absoluteString, destination: url)
+                                .font(.caption)
+                                .foregroundStyle(.blue)
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .multilineTextAlignment(.center)
+                } else {
+                    Text("Fetching local IP address...")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity)
+                        .multilineTextAlignment(.center)
+                }
+            }
         }
+    }
+
+    private func restartServerWithNewPort(_ port: Int) {
+        Task {
+            await ServerConfigurationHelpers.restartServerWithNewPort(port, serverManager: serverManager)
+        }
+    }
+
+    private func restartServerWithNewBindAddress() {
+        Task {
+            await ServerConfigurationHelpers.restartServerWithNewBindAddress(
+                accessMode: accessMode,
+                serverManager: serverManager
+            )
+        }
+    }
+
+    private func updateLocalIPAddress() async {
+        localIPAddress = await ServerConfigurationHelpers.updateLocalIPAddress(accessMode: accessMode)
     }
 
     private func checkPortAvailability() async {

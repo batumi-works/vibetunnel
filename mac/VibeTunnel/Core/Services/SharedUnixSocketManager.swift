@@ -5,7 +5,7 @@ import OSLog
 /// This handles all control messages between the Mac app and the server
 @MainActor
 final class SharedUnixSocketManager {
-    private let logger = Logger(subsystem: "sh.vibetunnel.vibetunnel", category: "SharedUnixSocket")
+    private let logger = Logger(subsystem: BundleIdentifiers.loggerSubsystem, category: "SharedUnixSocket")
 
     // MARK: - Singleton
 
@@ -22,6 +22,10 @@ final class SharedUnixSocketManager {
     private init() {
         logger.info("🚀 SharedUnixSocketManager initialized")
     }
+    
+    // MARK: - Notifications
+    
+    static let unixSocketReadyNotification = Notification.Name("unixSocketReady")
 
     // MARK: - Public Methods
 
@@ -41,9 +45,35 @@ final class SharedUnixSocketManager {
                 self?.distributeMessage(data)
             }
         }
+        
+        // Set up state change handler to notify when socket is ready
+        socket.onStateChange = { [weak self] state in
+            Task { @MainActor [weak self] in
+                self?.handleSocketStateChange(state)
+            }
+        }
 
         unixSocket = socket
         return socket
+    }
+    
+    /// Handle socket state changes and notify when ready
+    private func handleSocketStateChange(_ state: UnixSocketConnection.ConnectionState) {
+        switch state {
+        case .ready:
+            logger.info("🚀 Unix socket is ready, posting notification")
+            NotificationCenter.default.post(name: Self.unixSocketReadyNotification, object: nil)
+        case .failed(let error):
+            logger.error("❌ Unix socket connection failed: \(error)")
+        case .cancelled:
+            logger.info("🛑 Unix socket connection cancelled")
+        case .preparing:
+            logger.debug("🔄 Unix socket is preparing connection")
+        case .setup:
+            logger.debug("🔧 Unix socket is in setup state")
+        case .waiting(let error):
+            logger.warning("⏳ Unix socket is waiting: \(error)")
+        }
     }
 
     /// Check if the shared connection is connected

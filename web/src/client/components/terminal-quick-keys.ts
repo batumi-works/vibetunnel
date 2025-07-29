@@ -77,7 +77,6 @@ export class TerminalQuickKeys extends LitElement {
     pasteText?: string
   ) => void;
   @property({ type: Boolean }) visible = false;
-  @property({ type: Number }) keyboardHeight = 0;
 
   @state() private showFunctionKeys = false;
   @state() private showCtrlKeys = false;
@@ -89,7 +88,6 @@ export class TerminalQuickKeys extends LitElement {
 
   // Chord system state
   private activeModifiers = new Set<string>();
-  private touchIdentifiers = new Map<string, number>(); // Track which touch is on which key
 
   connectedCallback() {
     super.connectedCallback();
@@ -111,17 +109,9 @@ export class TerminalQuickKeys extends LitElement {
     this.isLandscape = window.innerWidth > window.innerHeight && window.innerWidth > 600;
   }
 
-  private getButtonSizeClass(label: string): string {
-    if (label.length >= 4) {
-      // Long text: compact with max-width constraint
-      return this.isLandscape ? 'px-0.5 py-1 flex-1 max-w-14' : 'px-0.5 py-1.5 flex-1 max-w-16';
-    } else if (label.length === 3) {
-      // Medium text: slightly more padding, larger max-width
-      return this.isLandscape ? 'px-1 py-1 flex-1 max-w-16' : 'px-1 py-1.5 flex-1 max-w-18';
-    } else {
-      // Short text: can grow freely
-      return this.isLandscape ? 'px-1 py-1 flex-1' : 'px-1 py-1.5 flex-1';
-    }
+  private getButtonSizeClass(_label: string): string {
+    // Use flexible sizing without constraining width
+    return this.isLandscape ? 'px-1 py-1' : 'px-1.5 py-1.5';
   }
 
   private getButtonFontClass(label: string): string {
@@ -136,9 +126,6 @@ export class TerminalQuickKeys extends LitElement {
 
   updated(changedProperties: PropertyValues) {
     super.updated(changedProperties);
-    if (changedProperties.has('keyboardHeight')) {
-      console.log('[QuickKeys] Keyboard height changed:', this.keyboardHeight);
-    }
   }
 
   private handleKeyPress(
@@ -215,7 +202,7 @@ export class TerminalQuickKeys extends LitElement {
     }
 
     if (this.onKeyPress) {
-      this.onKeyPress(key, isModifier, isSpecial);
+      this.onKeyPress(key, isModifier, isSpecial, isToggle);
     }
   }
 
@@ -238,7 +225,7 @@ export class TerminalQuickKeys extends LitElement {
 
     // Send first key immediately
     if (this.onKeyPress) {
-      this.onKeyPress(key, isModifier, isSpecial);
+      this.onKeyPress(key, isModifier, isSpecial, false);
     }
 
     // Start repeat after 500ms initial delay
@@ -284,27 +271,22 @@ export class TerminalQuickKeys extends LitElement {
           position: fixed;
           left: 0;
           right: 0;
-          /* Chrome: Use env() if supported */
-          bottom: env(keyboard-inset-height, 0px);
-          /* Safari: Will be overridden by inline style */
+          bottom: 0;
           z-index: 999999;
-          /* Ensure it stays on top */
-          isolation: isolate;
-          /* Smooth transition when keyboard appears/disappears */
-          transition: bottom 0.3s ease-out;
           background-color: rgb(var(--color-bg-secondary));
+          width: 100%;
+          /* Properly handle safe areas */
+          padding-left: env(safe-area-inset-left);
+          padding-right: env(safe-area-inset-right);
         }
         
         /* The actual bar with buttons */
         .quick-keys-bar {
           background: rgb(var(--color-bg-secondary));
           border-top: 1px solid rgb(var(--color-border-base));
-          padding: 0.5rem 0.25rem;
-          /* Prevent iOS from adding its own styling */
-          -webkit-appearance: none;
-          appearance: none;
-          /* Add shadow for visibility */
-          box-shadow: 0 -2px 10px rgb(var(--color-bg-secondary) / 0.5);
+          padding: 0.25rem 0;
+          width: 100%;
+          box-sizing: border-box;
         }
         
         /* Quick key buttons */
@@ -313,8 +295,6 @@ export class TerminalQuickKeys extends LitElement {
           -webkit-tap-highlight-color: transparent;
           user-select: none;
           -webkit-user-select: none;
-          /* Ensure buttons are clickable */
-          touch-action: manipulation;
         }
         
         /* Modifier key styling */
@@ -359,20 +339,6 @@ export class TerminalQuickKeys extends LitElement {
           font-size: 8px;
         }
         
-        /* Max width constraints for buttons */
-        .max-w-14 {
-          max-width: 3.5rem; /* 56px */
-        }
-        
-        .max-w-16 {
-          max-width: 4rem; /* 64px */
-        }
-        
-        .max-w-18 {
-          max-width: 4.5rem; /* 72px */
-        }
-        
-        
         /* Combo key styling (like ^C, ^Z) */
         .combo-key {
           background-color: rgb(var(--color-bg-tertiary));
@@ -400,7 +366,6 @@ export class TerminalQuickKeys extends LitElement {
           -webkit-tap-highlight-color: transparent;
           user-select: none;
           -webkit-user-select: none;
-          touch-action: manipulation;
         }
         
         /* Toggle button styling */
@@ -429,15 +394,8 @@ export class TerminalQuickKeys extends LitElement {
           -webkit-tap-highlight-color: transparent;
           user-select: none;
           -webkit-user-select: none;
-          touch-action: manipulation;
         }
         
-        /* Landscape mode adjustments */
-        @media (orientation: landscape) and (max-width: 926px) {
-          .quick-keys-bar {
-            padding: 0.45rem 0.225rem;
-          }
-        }
       </style>
     `;
   }
@@ -445,20 +403,16 @@ export class TerminalQuickKeys extends LitElement {
   render() {
     if (!this.visible) return '';
 
-    // For Safari: use JavaScript-calculated position when keyboard is visible
-    const bottomPosition = this.keyboardHeight > 0 ? `${this.keyboardHeight}px` : null;
-
     // Use the same layout for all mobile devices (phones and tablets)
     return html`
       <div 
         class="terminal-quick-keys-container"
-        style=${bottomPosition ? `bottom: ${bottomPosition}` : ''}
         @mousedown=${(e: Event) => e.preventDefault()}
         @touchstart=${(e: Event) => e.preventDefault()}
       >
         <div class="quick-keys-bar">
           <!-- Row 1 -->
-          <div class="flex gap-0.5 justify-center mb-1">
+          <div class="flex gap-0.5 mb-0.5 overflow-x-auto scrollbar-hide px-0.5">
             ${TERMINAL_QUICK_KEYS.filter((k) => k.row === 1).map(
               ({ key, label, modifier, arrow, toggle }) => html`
                 <button
@@ -510,7 +464,7 @@ export class TerminalQuickKeys extends LitElement {
             this.showCtrlKeys
               ? html`
               <!-- Ctrl shortcuts row -->
-              <div class="flex gap-0.5 justify-between flex-wrap mb-1">
+              <div class="flex gap-0.5 mb-0.5 overflow-x-auto scrollbar-hide px-0.5">
                 ${CTRL_SHORTCUTS.map(
                   ({ key, label, combo, special }) => html`
                     <button
@@ -545,7 +499,7 @@ export class TerminalQuickKeys extends LitElement {
               : this.showFunctionKeys
                 ? html`
               <!-- Function keys row -->
-              <div class="flex gap-0.5 justify-between mb-1">
+              <div class="flex gap-0.5 mb-0.5 overflow-x-auto scrollbar-hide px-0.5">
                 ${FUNCTION_KEYS.map(
                   ({ key, label }) => html`
                     <button
@@ -579,7 +533,7 @@ export class TerminalQuickKeys extends LitElement {
             `
                 : html`
               <!-- Regular row 2 -->
-              <div class="flex gap-0.5 justify-center mb-1">
+              <div class="flex gap-0.5 mb-0.5 overflow-x-auto scrollbar-hide px-0.5">
                 ${TERMINAL_QUICK_KEYS.filter((k) => k.row === 2).map(
                   ({ key, label, modifier, combo, special, toggle }) => html`
                     <button
@@ -600,12 +554,12 @@ export class TerminalQuickKeys extends LitElement {
                         if (key === 'Paste') {
                           this.handlePasteImmediate(e);
                         } else {
-                          this.handleKeyPress(key, modifier || combo, special, toggle, e);
+                          this.handleKeyPress(key, modifier || combo, special, false, e);
                         }
                       }}
                       @click=${(e: MouseEvent) => {
                         if (e.detail !== 0) {
-                          this.handleKeyPress(key, modifier || combo, special, toggle, e);
+                          this.handleKeyPress(key, modifier || combo, special, false, e);
                         }
                       }}
                     >
@@ -618,7 +572,7 @@ export class TerminalQuickKeys extends LitElement {
           }
           
           <!-- Row 3 - Additional special characters (always visible) -->
-          <div class="flex gap-0.5 justify-center">
+          <div class="flex gap-0.5 overflow-x-auto scrollbar-hide px-0.5">
             ${TERMINAL_QUICK_KEYS.filter((k) => k.row === 3).map(
               ({ key, label, modifier, combo, special }) => html`
                 <button

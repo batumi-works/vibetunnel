@@ -1,85 +1,179 @@
 # Push Notifications in VibeTunnel
 
-Push notifications in VibeTunnel allow you to receive real-time alerts about your terminal sessions, even when the web interface isn't active or visible. This keeps you informed about important events like completed commands, session exits, or system alerts.
+VibeTunnel provides real-time alerts for terminal events via native macOS notifications and web push notifications. The system is primarily driven by the **Session Monitor**, which tracks terminal activity and triggers alerts.
 
-## User Guide
+## How It Works
 
-1. **Enable Notifications**: Click the notification status indicator in the web interface (typically shows as red when disabled)
-2. **Grant Permission**: Your browser will prompt you to allow notifications - click "Allow"
-3. **Configure Settings**: Choose which types of notifications you want to receive
+The **Session Monitor** is the core of the notification system. It observes terminal sessions for key events and dispatches them to the appropriate notification service (macOS or web).
 
-VibeTunnel supports several types of notifications:
+### Notification Settings Explained
 
-- **Bell Events**: Triggered when terminal programs send a bell character (e.g., when a command completes)
-- **Session Start**: Notified when a new terminal session begins
-- **Session Exit**: Alerted when a terminal session ends
-- **Session Errors**: Informed about session failures or errors
-- **System Alerts**: Receive server status and system-wide notifications
+When you enable notifications in VibeTunnel, you can choose which events to be notified about:
 
-Access notification settings by clicking the notification status indicator:
+#### 1. Session starts ✓
+- **Notification**: "Session Started" with the session name
+- **Triggers when**: A new terminal session is created
+- **Use case**: Know when someone starts using your shared terminal
 
-- **Enable/Disable**: Toggle notifications on or off entirely
-- **Notification Types**: Choose which events trigger notifications (Session Exit and System Alerts are enabled by default)
-- **Behavior**: Control sound and vibration settings
-- **Test**: Send a test notification to verify everything works
+#### 2. Session ends ✓
+- **Notification**: "Session Ended" with the session name
+- **Shows exit code**: If the session crashed or exited abnormally
+- **Triggers when**: A terminal session closes
+- **Use case**: Monitor when sessions terminate, especially if unexpected
 
-Note that just because you can configure something, does not mean your browser will support it.
+#### 3. Commands complete (> 3 seconds) ✓
+- **Notification**: "Your Turn" with the command that finished
+- **Shows duration**: How long the command took to complete
+- **Triggers when**: Any command that runs for more than 3 seconds finishes
+- **Use case**: Get notified when long builds, tests, or scripts complete
 
-## Push and Claude
+#### 4. Commands fail ✓
+- **Notification**: "Command Failed" with the failed command
+- **Shows exit code**: The specific error code returned
+- **Triggers when**: Any command returns a non-zero exit code
+- **Use case**: Immediately know when something goes wrong
 
-Claude code by default tries auto detection for terminal bells which can cause issues.  You can force it
-to emit a bell with this command:
+#### 5. Terminal bell (\u{0007}) ✓
+- **Notification**: "Terminal Bell" with the session name
+- **Triggers when**: A program outputs the bell character (ASCII 7/^G)
+- **Common sources**: vim alerts, IRC mentions, completion sounds
+- **Use case**: Get alerts from terminal programs that use the bell
+
+#### 6. Claude turn notifications ✓
+- **Notification**: "Your Turn" when Claude finishes responding
+- **Smart detection**: Monitors Claude CLI sessions automatically
+- **Triggers when**: Claude transitions from typing to waiting for input
+- **How it works**: 
+  - Detects sessions running Claude (by command or app name)
+  - Tracks when Claude stops outputting text
+  - Only notifies once per response (won't spam)
+- **Use case**: Know when Claude has finished its response and needs your input
+
+## Architecture
+
+### System Overview
+
+The notification system in VibeTunnel follows a layered architecture:
 
 ```
-claude config set --global preferredNotifChannel terminal_bell
+Terminal Events → Session Monitor → Event Processing → Notification Service → OS/Browser
 ```
+
+### Key Components
+
+#### 1. Session Monitor (`SessionMonitor.swift`)
+- **Role**: Tracks all terminal sessions and their state changes
+- **Key responsibilities**:
+  - Monitors session lifecycle (start/exit)
+  - Tracks command execution and duration
+  - Detects Claude CLI activity transitions
+  - Filters events based on thresholds (e.g., 3-second rule)
+
+#### 2. Server Event System (`ServerEvent.swift`)
+- **Event types**: 
+  - `sessionStart`, `sessionExit`: Session lifecycle
+  - `commandFinished`, `commandError`: Command execution
+  - `bell`: Terminal bell character detection
+  - `claudeTurn`: Claude AI idle detection
+- **Event data**: Each event carries session ID, display name, duration, exit codes, etc.
+
+#### 3. Notification Service (`NotificationService.swift`)
+- **macOS integration**: Uses `UserNotifications` framework
+- **Event source**: Connects to server via SSE at `/api/events`
+- **Preference management**: Checks user settings before sending
+- **Permission handling**: Manages notification authorization
+
+#### 4. Configuration Manager (`ConfigManager.swift`)
+- **Settings storage**: Persists user notification preferences
+- **Default values**: All notification types enabled by default
+- **Real-time updates**: Changes take effect immediately
+
+### Event Flow
+
+1. **Terminal Activity**: User runs commands, sessions start/stop
+2. **Event Detection**: Session Monitor detects changes
+3. **Event Creation**: Creates typed `ServerEvent` objects
+4. **Filtering**: Checks user preferences and thresholds
+5. **Notification Dispatch**: Sends to OS notification center
+6. **User Interaction**: Shows native macOS notifications
+
+### Special Features
+
+#### Claude Detection Algorithm
+```swift
+// Detects Claude sessions by command or app name
+let isClaudeSession = session.command.contains("claude") || 
+                     session.app.lowercased().contains("claude")
+
+// Tracks activity state transitions
+if previousActive && !currentActive && !alreadyNotified {
+    // Claude went from typing to idle - send notification
+}
+```
+
+#### Command Duration Tracking
+- Only notifies for commands > 3 seconds
+- Tracks start time when command begins
+- Calculates duration on completion
+- Formats duration for display (e.g., "5 seconds", "2 minutes")
+
+#### Bell Character Detection
+- Terminal emulator detects ASCII 7 (`\u{0007}`)
+- Forwards bell events through WebSocket
+- Server converts to notification event
+
+## Native macOS Notifications
+
+The VibeTunnel macOS app provides the most reliable and feature-rich notification experience.
+
+- **Enable**: Go to `VibeTunnel Settings > General` and toggle **Show Session Notifications**.
+- **Features**: Uses the native `UserNotifications` framework, respects Focus Modes, and works in the background.
+
+## Web Push Notifications
+
+For non-macOS clients or remote access, VibeTunnel supports web push notifications.
+
+- **Enable**: Click the notification icon in the web UI and grant browser permission.
+- **Technology**: Uses Service Workers and the Web Push API.
+
+### HTTPS Requirement
+
+⚠️ **Important**: Web push notifications require HTTPS to function. This is a security requirement enforced by all modern browsers.
+
+- **Local development**: Works on `http://localhost:4020` without HTTPS
+- **Remote access**: Requires HTTPS with a valid SSL certificate
+- **Why**: Service Workers (which power push notifications) only work on secure origins to prevent man-in-the-middle attacks
+
+### Enabling HTTPS for Remote Access
+
+If you need web push notifications when accessing VibeTunnel remotely, you'll need to serve it over HTTPS. Here are some solutions:
+
+#### Tailscale Serve (Recommended)
+[Tailscale Serve](https://tailscale.com/kb/1242/tailscale-serve) is an excellent solution for automatically creating HTTPS connections within your network:
+
+```bash
+# Install Tailscale and connect to your network
+# Then expose VibeTunnel with HTTPS:
+tailscale serve https / http://localhost:4020
+```
+
+Benefits:
+- Automatic HTTPS with valid certificates
+- Works within your Tailscale network
+- No port forwarding or firewall configuration needed
+- Push notifications will work for all devices on your Tailnet
+
+#### Other Options
+- **Ngrok**: Provides HTTPS tunnels but requires external exposure
+- **Cloudflare Tunnel**: Free HTTPS tunneling service
+- **Let's Encrypt**: For permanent HTTPS setup with your own domain
 
 ## Troubleshooting
 
-- **Not receiving notifications**: Check that notifications are enabled both in VibeTunnel settings and your browser permissions
-- **Too many notifications**: Adjust which notification types are enabled in the settings
-- **Missing notifications**: Ensure your browser supports Service Workers and the Push API (most modern browsers do)
+- **No Notifications**: Ensure they are enabled in both VibeTunnel settings and your OS/browser settings.
+- **Duplicate Notifications**: You can clear old or duplicate subscriptions by deleting `~/.vibetunnel/notifications/subscriptions.json`.
+- **Claude Notifications**: If Claude's "Your Turn" notifications aren't working, you can try forcing it to use the terminal bell:
+  ```bash
+  claude config set --global preferredNotifChannel terminal_bell
+  ```
 
-## Technical Implementation
-
-VibeTunnel's push notification system uses rather modern web standards:
-
-- **Web Push API**: For delivering notifications to browsers
-- **Service Workers**: Handle notifications when the app isn't active
-- **VAPID Protocol**: Secure authentication between server and browser
-- **Terminal Integration**: Smart detection of bell characters and session events
-
-### Bell Detection
-
-The system intelligently detects when terminal programs send bell characters (ASCII 7):
-
-- **Smart Filtering**: Ignores escape sequences that end with bell characters (not actual alerts)
-- **Process Context**: Identifies which program triggered the bell for meaningful notifications (best effort)
-
-## Subscription State
-
-VibeTunnel stores push notification data in the `~/.vibetunnel/` directory:
-
-```
-~/.vibetunnel/
-├── vapid/
-│   └── keys.json                     # VAPID public/private key pair
-└── notifications/
-    └── subscriptions.json            # Push notification subscriptions
-```
-
-**VAPID Keys** (`~/.vibetunnel/vapid/keys.json`):
-- Contains the public/private key pair used for VAPID authentication
-- File permissions are restricted to owner-only (0o600) for security
-- Keys are automatically generated on first run if not present
-- Used to authenticate push notifications with browser push services
-- Don't delete this or bad stuff happens to existing subscriptions.
-
-**Subscriptions** (`~/.vibetunnel/notifications/subscriptions.json`):
-- Stores active push notification subscriptions from browsers
-- Each subscription includes endpoint URL, encryption keys, and metadata
-- Automatically cleaned up when subscriptions become invalid or expired
-- Synchronized across all active sessions for the same user
-- If you get duplicated push notifications, you can try to delete old sessions here.
-
-The subscription data is persistent across application restarts and allows VibeTunnel to continue sending notifications even after the server restarts.

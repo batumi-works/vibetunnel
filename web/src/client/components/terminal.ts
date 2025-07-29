@@ -15,7 +15,6 @@ import { html, LitElement, type PropertyValues } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { processKeyboardShortcuts } from '../utils/keyboard-shortcut-highlighter.js';
 import { createLogger } from '../utils/logger.js';
-import { detectMobile } from '../utils/mobile-utils.js';
 import { TerminalPreferencesManager } from '../utils/terminal-preferences.js';
 import { TERMINAL_THEMES, type TerminalThemeId } from '../utils/terminal-themes.js';
 import { getCurrentTheme } from '../utils/theme-utils.js';
@@ -55,6 +54,7 @@ export class Terminal extends LitElement {
   private debugMode = false;
   private renderCount = 0;
   private totalRenderTime = 0;
+  private _lastFitTime?: number;
   private lastRenderTime = 0;
 
   get viewportY() {
@@ -68,7 +68,6 @@ export class Terminal extends LitElement {
   @state() private cursorVisible = true; // Track cursor visibility state
 
   private container: HTMLElement | null = null;
-  private resizeTimeout: NodeJS.Timeout | null = null;
   private explicitSizeSet = false; // Flag to prevent auto-resize when size is explicitly set
 
   // Virtual scrolling optimization
@@ -107,6 +106,7 @@ export class Terminal extends LitElement {
     logger.debug('Requesting render buffer update');
     this.queueRenderOperation(() => {
       logger.debug('Executing render operation');
+      this.renderBuffer();
     });
   }
 
@@ -328,10 +328,14 @@ export class Terminal extends LitElement {
   }
 
   private requestResize(source: string) {
-    // Update mobile state using consistent detection
-    this.isMobile = detectMobile();
+    // Update mobile state using window width for consistency with app.ts
+    // This ensures Chrome mobile simulation works correctly
+    const MOBILE_BREAKPOINT = 768; // Same as BREAKPOINTS.MOBILE
+    this.isMobile = window.innerWidth < MOBILE_BREAKPOINT;
 
-    logger.debug(`[Terminal] Resize requested from ${source} (mobile: ${this.isMobile})`);
+    logger.debug(
+      `[Terminal] Resize requested from ${source} (mobile: ${this.isMobile}, width: ${window.innerWidth})`
+    );
 
     // Cancel any pending resize
     if (this.pendingResize) {
@@ -451,6 +455,7 @@ export class Terminal extends LitElement {
 
   private async initializeTerminal() {
     try {
+      logger.debug('initializeTerminal starting');
       this.requestUpdate();
 
       this.container = this.querySelector('#terminal-container') as HTMLElement;
@@ -460,6 +465,8 @@ export class Terminal extends LitElement {
         logger.error('terminal container not found', error);
         throw error;
       }
+
+      logger.debug('Terminal container found, proceeding with setup');
 
       await this.setupTerminal();
       this.setupResize();
@@ -518,6 +525,9 @@ export class Terminal extends LitElement {
 
       // Set terminal size - don't call .open() to keep it headless
       this.terminal.resize(this.cols, this.rows);
+
+      // Force initial render of the buffer
+      this.requestRenderBuffer();
     } catch (error) {
       logger.error('failed to create terminal:', error);
       throw error;
@@ -560,7 +570,21 @@ export class Terminal extends LitElement {
       return;
     }
 
-    logger.debug(`[Terminal] fitTerminal called from source: ${source || 'unknown'}`);
+    const timestamp = Date.now();
+    const timeSinceLastFit = this._lastFitTime ? timestamp - this._lastFitTime : 0;
+    this._lastFitTime = timestamp;
+
+    logger.debug(`[Terminal] 📱 fitTerminal called`, {
+      source: source || 'unknown',
+      isMobile: this.isMobile,
+      windowWidth: window.innerWidth,
+      timeSinceLastFit,
+      cols: this.cols,
+      rows: this.rows,
+      actualRows: this.actualRows,
+      bufferLength: this.terminal.buffer.active.length,
+    });
+
     // Use the class property instead of rechecking
     if (this.isMobile) {
       logger.debug(
@@ -734,10 +758,11 @@ export class Terminal extends LitElement {
   private setupResize() {
     if (!this.container) return;
 
-    // Set the class property using consistent detection
-    this.isMobile = detectMobile();
+    // Set the class property using window width for consistency with app.ts
+    const MOBILE_BREAKPOINT = 768; // Same as BREAKPOINTS.MOBILE
+    this.isMobile = window.innerWidth < MOBILE_BREAKPOINT;
     logger.debug(
-      `[Terminal] Setting up resize - isMobile: ${this.isMobile}, userAgent: ${navigator.userAgent}`
+      `[Terminal] Setting up resize - isMobile: ${this.isMobile}, width: ${window.innerWidth}, userAgent: ${navigator.userAgent}`
     );
 
     if (this.isMobile) {
@@ -929,14 +954,6 @@ export class Terminal extends LitElement {
     this.container.addEventListener('pointercancel', handlePointerCancel);
   }
 
-  private scrollViewport(deltaLines: number) {
-    if (!this.terminal) return;
-
-    const lineHeight = this.fontSize * 1.2;
-    const deltaPixels = deltaLines * lineHeight;
-    this.scrollViewportPixels(deltaPixels);
-  }
-
   private scrollViewportPixels(deltaPixels: number) {
     if (!this.terminal) return;
 
@@ -1034,7 +1051,15 @@ export class Terminal extends LitElement {
   }
 
   private renderBuffer() {
-    if (!this.terminal || !this.container) return;
+    if (!this.terminal || !this.container) {
+      logger.warn('renderBuffer called but missing terminal or container', {
+        hasTerminal: !!this.terminal,
+        hasContainer: !!this.container,
+      });
+      return;
+    }
+
+    logger.debug('renderBuffer executing');
 
     const startTime = this.debugMode ? performance.now() : 0;
 
@@ -1266,7 +1291,21 @@ export class Terminal extends LitElement {
    * @param followCursor - If true, automatically scroll to keep cursor visible (default: true)
    */
   public write(data: string, followCursor: boolean = true) {
-    if (!this.terminal) return;
+    if (!this.terminal) {
+      logger.warn('Terminal.write called but no terminal instance exists');
+      return;
+    }
+
+    // Only log significant writes on mobile
+    if (this.isMobile && data.length > 100) {
+      logger.debug(`[Terminal] 📱 Large write to terminal`, {
+        sessionId: this.sessionId,
+        dataLength: data.length,
+        followCursor,
+        bufferLength: this.terminal.buffer.active.length,
+        scrollPosition: this._viewportY,
+      });
+    }
 
     // Check for cursor visibility sequences
     if (data.includes('\x1b[?25l')) {
@@ -1288,16 +1327,9 @@ export class Terminal extends LitElement {
         }
       });
 
-      // Follow cursor: scroll to bottom if enabled
+      // Follow cursor if requested
       if (followCursor && this.followCursorEnabled) {
-        const buffer = this.terminal.buffer.active;
-        const lineHeight = this.fontSize * 1.2;
-        const maxScrollPixels = Math.max(0, (buffer.length - this.actualRows) * lineHeight);
-
-        // Set programmatic scroll flag and scroll to bottom
-        this.programmaticScroll = true;
-        this.viewportY = maxScrollPixels;
-        this.programmaticScroll = false;
+        this.followCursor();
       }
     });
   }
@@ -1458,6 +1490,41 @@ export class Terminal extends LitElement {
   }
 
   /**
+   * Check if the terminal is currently scrolled to the bottom.
+   * @returns True if at bottom, false otherwise
+   */
+  private isScrolledToBottom(): boolean {
+    if (!this.terminal) return true;
+
+    const buffer = this.terminal.buffer.active;
+    const lineHeight = this.fontSize * 1.2;
+    const maxScrollPixels = Math.max(0, (buffer.length - this.actualRows) * lineHeight);
+
+    // Consider "at bottom" if within one line height of the bottom
+    return this.viewportY >= maxScrollPixels - lineHeight;
+  }
+
+  /**
+   * Update follow cursor state based on current scroll position.
+   * Disable follow cursor when user scrolls away from bottom.
+   * Re-enable when user scrolls back to bottom.
+   */
+  private updateFollowCursorState(): void {
+    // Don't update state during programmatic scrolling
+    if (this.programmaticScroll) return;
+
+    const wasAtBottom = this.isScrolledToBottom();
+
+    if (wasAtBottom && !this.followCursorEnabled) {
+      // User scrolled back to bottom - re-enable follow cursor
+      this.followCursorEnabled = true;
+    } else if (!wasAtBottom && this.followCursorEnabled) {
+      // User scrolled away from bottom - disable follow cursor
+      this.followCursorEnabled = false;
+    }
+  }
+
+  /**
    * Scroll the viewport to follow the cursor position.
    * This ensures the cursor stays visible during text input or playback.
    */
@@ -1493,41 +1560,6 @@ export class Terminal extends LitElement {
 
     // Clear programmatic scroll flag
     this.programmaticScroll = false;
-  }
-
-  /**
-   * Check if the terminal is currently scrolled to the bottom.
-   * @returns True if at bottom, false otherwise
-   */
-  private isScrolledToBottom(): boolean {
-    if (!this.terminal) return true;
-
-    const buffer = this.terminal.buffer.active;
-    const lineHeight = this.fontSize * 1.2;
-    const maxScrollPixels = Math.max(0, (buffer.length - this.actualRows) * lineHeight);
-
-    // Consider "at bottom" if within one line height of the bottom
-    return this.viewportY >= maxScrollPixels - lineHeight;
-  }
-
-  /**
-   * Update follow cursor state based on current scroll position.
-   * Disable follow cursor when user scrolls away from bottom.
-   * Re-enable when user scrolls back to bottom.
-   */
-  private updateFollowCursorState(): void {
-    // Don't update state during programmatic scrolling
-    if (this.programmaticScroll) return;
-
-    const wasAtBottom = this.isScrolledToBottom();
-
-    if (wasAtBottom && !this.followCursorEnabled) {
-      // User scrolled back to bottom - re-enable follow cursor
-      this.followCursorEnabled = true;
-    } else if (!wasAtBottom && this.followCursorEnabled) {
-      // User scrolled away from bottom - disable follow cursor
-      this.followCursorEnabled = false;
-    }
   }
 
   /**

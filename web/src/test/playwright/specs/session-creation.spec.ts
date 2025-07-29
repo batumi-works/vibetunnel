@@ -9,6 +9,7 @@ import {
   reconnectToSession,
 } from '../helpers/session-lifecycle.helper';
 import { TestSessionManager } from '../helpers/test-data-manager.helper';
+import { waitForSessionCard } from '../helpers/test-optimization.helper';
 import { waitForElementStable } from '../helpers/wait-strategies.helper';
 import { SessionListPage } from '../pages/session-list.page';
 
@@ -24,10 +25,14 @@ interface SessionCardElement extends HTMLElement {
 test.describe.configure({ mode: 'parallel' });
 
 test.describe('Session Creation', () => {
+  // Increase timeout for session creation tests in CI
+  test.setTimeout(process.env.CI ? 60000 : 30000);
+
   let sessionManager: TestSessionManager;
 
   test.beforeEach(async ({ page }) => {
-    sessionManager = new TestSessionManager(page);
+    // Use unique prefix for this test file to prevent session conflicts
+    sessionManager = new TestSessionManager(page, 'sesscreate');
   });
 
   test.afterEach(async () => {
@@ -63,7 +68,7 @@ test.describe('Session Creation', () => {
 
     // Start from session list page
     await page.goto('/');
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('domcontentloaded');
 
     // Get initial session count
     const initialCount = await page.locator('session-card').count();
@@ -75,7 +80,7 @@ test.describe('Session Creation', () => {
     await sessionListPage.createNewSession(sessionName, false);
 
     // Wait for navigation to session view
-    await page.waitForURL(/\?session=/, { timeout: 10000 });
+    await page.waitForURL(/\/session\//, { timeout: 10000 });
     console.log(`Navigated to session: ${page.url()}`);
 
     // Wait for terminal to be ready
@@ -83,14 +88,14 @@ test.describe('Session Creation', () => {
 
     // Navigate back to session list
     await page.goto('/');
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('domcontentloaded');
 
     // Wait for multiple refresh cycles (auto-refresh happens every 1 second)
     await page.waitForTimeout(5000);
 
     // Force a page reload to ensure we get the latest session list
     await page.reload();
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('domcontentloaded');
 
     // Check session count increased
     const newCount = await page.locator('session-card').count();
@@ -153,7 +158,7 @@ test.describe('Session Creation', () => {
     const sessions: string[] = [];
 
     // Start from the session list page
-    await page.goto('/', { waitUntil: 'networkidle' });
+    await page.goto('/', { waitUntil: 'domcontentloaded' });
 
     // Only create 1 session to reduce test complexity in CI
     for (let i = 0; i < 1; i++) {
@@ -174,19 +179,24 @@ test.describe('Session Creation', () => {
       await page.fill('input[placeholder="My Session"]', sessionName);
       await page.fill('input[placeholder="zsh"]', 'bash');
 
-      // Make sure spawn window is off
+      // Make sure spawn window is off (if toggle exists)
       const spawnToggle = page.locator('button[role="switch"]').first();
-      const isChecked = (await spawnToggle.getAttribute('aria-checked')) === 'true';
-      if (isChecked) {
-        await spawnToggle.click();
-        // Wait for toggle state to update
-        await page.waitForFunction(
-          () => {
-            const toggle = document.querySelector('button[role="switch"]');
-            return toggle?.getAttribute('aria-checked') === 'false';
-          },
-          { timeout: 1000 }
-        );
+      try {
+        const isChecked =
+          (await spawnToggle.getAttribute('aria-checked', { timeout: 1000 })) === 'true';
+        if (isChecked) {
+          await spawnToggle.click();
+          // Wait for toggle state to update
+          await page.waitForFunction(
+            () => {
+              const toggle = document.querySelector('button[role="switch"]');
+              return toggle?.getAttribute('aria-checked') === 'false';
+            },
+            { timeout: 1000 }
+          );
+        }
+      } catch {
+        // Spawn toggle might not exist or might be in a collapsed section - skip
       }
 
       // Create session
@@ -203,7 +213,7 @@ test.describe('Session Creation', () => {
       }
 
       // Check if we navigated to the session
-      if (page.url().includes('?session=')) {
+      if (page.url().includes('/session/')) {
         // Wait for terminal to be ready before navigating back
         await page.waitForSelector('vibe-terminal', { state: 'visible', timeout: 10000 });
         await assertTerminalReady(page, 15000);
@@ -220,7 +230,7 @@ test.describe('Session Creation', () => {
 
     // Navigate to list and verify all exist
     await page.goto('/');
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('domcontentloaded');
     await page.waitForSelector('session-card', { state: 'visible', timeout: 15000 });
 
     // Add a longer delay to ensure the session list is fully updated
@@ -228,7 +238,7 @@ test.describe('Session Creation', () => {
 
     // Force a reload to get the latest session list
     await page.reload();
-    await page.waitForLoadState('networkidle');
+    await page.waitForLoadState('domcontentloaded');
 
     // Additional wait after reload
     await page.waitForTimeout(3000);
@@ -277,14 +287,76 @@ test.describe('Session Creation', () => {
   test('should reconnect to existing session', async ({ page }) => {
     // Create and track session
     const { sessionName } = await sessionManager.createTrackedSession();
-    await assertTerminalReady(page, 15000);
+    await assertTerminalReady(page, 20000);
+
+    // Ensure terminal is focused and ready for input
+    const terminal = page.locator('vibe-terminal').first();
+    await terminal.click();
+
+    // Wait for shell prompt before typing - more robust detection
+    await page.waitForFunction(
+      () => {
+        const term = document.querySelector('vibe-terminal');
+        const container = term?.querySelector('#terminal-container');
+        const content = container?.textContent || term?.textContent || '';
+
+        // Check for common prompt patterns
+        const promptPatterns = [
+          /[$>#%❯]\s*$/, // Common prompts at end
+          /\$\s+$/, // Dollar with space
+          />\s+$/, // Greater than with space
+          /#\s+$/, // Root prompt with space
+          /\w+@[\w-]+/, // Username@hostname
+          /]\s*[$>#]/, // Bracketed prompt
+          /bash-\d+\.\d+\$/, // Bash version prompt
+        ];
+
+        return (
+          promptPatterns.some((pattern) => pattern.test(content)) ||
+          (content.length > 10 && content.trim().length > 0)
+        );
+      },
+      { timeout: 20000 }
+    );
+
+    // Small delay to ensure terminal is fully ready
+    await page.waitForTimeout(500);
+
+    // Execute a command to have some content in the terminal
+    await page.keyboard.type('echo "Test content before reconnect"');
+    await page.keyboard.press('Enter');
+
+    // Wait for command output to appear with longer timeout and better detection
+    await page.waitForFunction(
+      () => {
+        const terminal = document.querySelector('vibe-terminal');
+        const container = terminal?.querySelector('#terminal-container');
+        const content = container?.textContent || terminal?.textContent || '';
+        return content.includes('Test content before reconnect');
+      },
+      { timeout: 15000 }
+    );
 
     // Navigate away and back
     await page.goto('/');
+
+    // Wait for session list to fully load and the specific session to appear
+    await waitForSessionCard(page, sessionName, { timeout: 20000 });
+
     await reconnectToSession(page, sessionName);
 
-    // Verify reconnected
+    // Verify reconnected - wait for terminal to be ready
     await assertUrlHasSession(page);
-    await assertTerminalReady(page, 15000);
+    await assertTerminalReady(page, 20000);
+
+    // Verify previous content is still there with longer timeout
+    await page.waitForFunction(
+      () => {
+        const terminal = document.querySelector('vibe-terminal');
+        const content = terminal?.textContent || '';
+        return content.includes('Test content before reconnect');
+      },
+      { timeout: 10000 }
+    );
   });
 });

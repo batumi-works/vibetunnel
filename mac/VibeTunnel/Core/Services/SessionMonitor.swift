@@ -8,19 +8,34 @@ import os.log
 /// including its command, directory, process status, and activity information.
 struct ServerSessionInfo: Codable {
     let id: String
-    let command: [String] // Changed from String to [String] to match server
-    let name: String? // Added missing field
+    let name: String
+    let command: [String]
     let workingDir: String
     let status: String
     let exitCode: Int?
     let startedAt: String
+    let pid: Int?
+    let initialCols: Int?
+    let initialRows: Int?
+    let lastClearOffset: Int?
+    let version: String?
+    let gitRepoPath: String?
+    let gitBranch: String?
+    let gitAheadCount: Int?
+    let gitBehindCount: Int?
+    let gitHasChanges: Bool?
+    let gitIsWorktree: Bool?
+    let gitMainRepoPath: String?
+
+    // Additional fields from Session (not SessionInfo)
     let lastModified: String
-    let pid: Int? // Made optional since it might not exist for all sessions
-    let initialCols: Int? // Added missing field
-    let initialRows: Int? // Added missing field
+    let active: Bool?
     let activityStatus: ActivityStatus?
-    let source: String? // Added for HQ mode
-    let attachedViaVT: Bool? // Added for VT attachment tracking
+    let source: String?
+    let remoteId: String?
+    let remoteName: String?
+    let remoteUrl: String?
+    let attachedViaVT: Bool?
 
     var isRunning: Bool {
         status == "running"
@@ -55,33 +70,42 @@ struct SpecificStatus: Codable {
 final class SessionMonitor {
     static let shared = SessionMonitor()
 
+    /// Previous session states for exit detection
+    private var previousSessions: [String: ServerSessionInfo] = [:]
+    private var firstFetchDone = false
+
+    /// Detect sessions that transitioned from running to not running
+    static func detectEndedSessions(
+        from old: [String: ServerSessionInfo],
+        to new: [String: ServerSessionInfo]
+    )
+        -> [ServerSessionInfo]
+    {
+        old.compactMap { id, oldSession in
+            if oldSession.isRunning,
+               let updated = new[id], !updated.isRunning
+            {
+                return oldSession
+            }
+            return nil
+        }
+    }
+
     private(set) var sessions: [String: ServerSessionInfo] = [:]
     private(set) var lastError: Error?
 
     private var lastFetch: Date?
     private let cacheInterval: TimeInterval = 2.0
-    private let serverPort: Int
-    private var localAuthToken: String?
-    private let logger = Logger(subsystem: "sh.vibetunnel.vibetunnel", category: "SessionMonitor")
+    private let serverManager = ServerManager.shared
+    private let logger = Logger(subsystem: BundleIdentifiers.loggerSubsystem, category: "SessionMonitor")
 
     /// Reference to GitRepositoryMonitor for pre-caching
     weak var gitRepositoryMonitor: GitRepositoryMonitor?
 
-    /// Timer for periodic refresh
-    private var refreshTimer: Timer?
-
-    private init() {
-        let port = UserDefaults.standard.integer(forKey: "serverPort")
-        self.serverPort = port > 0 ? port : 4_020
-
-        // Start periodic refresh
-        startPeriodicRefresh()
-    }
+    private init() {}
 
     /// Set the local auth token for server requests
-    func setLocalAuthToken(_ token: String?) {
-        self.localAuthToken = token
-    }
+    func setLocalAuthToken(_ token: String?) {}
 
     /// Number of running sessions
     var sessionCount: Int {
@@ -109,33 +133,14 @@ final class SessionMonitor {
 
     private func fetchSessions() async {
         do {
-            // Get current port (might have changed)
-            let port = UserDefaults.standard.integer(forKey: "serverPort")
-            let actualPort = port > 0 ? port : serverPort
+            // Snapshot previous sessions for exit notifications
+            let _ = sessions
 
-            guard let url = URL(string: "http://localhost:\(actualPort)/api/sessions") else {
-                throw URLError(.badURL)
-            }
-
-            var request = URLRequest(url: url, timeoutInterval: 3.0)
-
-            // Add Host header to ensure request is recognized as local
-            request.setValue("localhost", forHTTPHeaderField: "Host")
-
-            // Add local auth token if available
-            if let token = localAuthToken {
-                request.setValue(token, forHTTPHeaderField: "X-VibeTunnel-Local")
-            }
-
-            let (data, response) = try await URLSession.shared.data(for: request)
-
-            guard let httpResponse = response as? HTTPURLResponse,
-                  httpResponse.statusCode == 200
-            else {
-                throw URLError(.badServerResponse)
-            }
-
-            let sessionsArray = try JSONDecoder().decode([ServerSessionInfo].self, from: data)
+            let sessionsArray = try await serverManager.performRequest(
+                endpoint: APIEndpoints.sessions,
+                method: "GET",
+                responseType: [ServerSessionInfo].self
+            )
 
             // Convert to dictionary
             var sessionsDict: [String: ServerSessionInfo] = [:]
@@ -145,19 +150,19 @@ final class SessionMonitor {
 
             self.sessions = sessionsDict
             self.lastError = nil
+
+            // Sessions have been updated
+
+            // Set firstFetchDone AFTER detecting ended sessions
+            firstFetchDone = true
             self.lastFetch = Date()
 
             // Update WindowTracker
             WindowTracker.shared.updateFromSessions(sessionsArray)
 
-            // Pre-cache Git data for all sessions
+            // Pre-cache Git data for all sessions (deduplicated by repository)
             if let gitMonitor = gitRepositoryMonitor {
-                for session in sessionsArray where gitMonitor.getCachedRepository(for: session.workingDir) == nil {
-                    Task {
-                        // This will cache the data for immediate access later
-                        _ = await gitMonitor.findRepository(for: session.workingDir)
-                    }
-                }
+                await preCacheGitRepositories(for: sessionsArray, using: gitMonitor)
             }
         } catch {
             // Only update error if it's not a simple connection error
@@ -170,16 +175,62 @@ final class SessionMonitor {
         }
     }
 
-    /// Start periodic refresh of sessions
-    private func startPeriodicRefresh() {
-        // Clean up any existing timer
-        refreshTimer?.invalidate()
+    /// Pre-cache Git repositories for sessions, deduplicating by repository root
+    private func preCacheGitRepositories(
+        for sessions: [ServerSessionInfo],
+        using gitMonitor: GitRepositoryMonitor
+    )
+        async
+    {
+        // Track unique directories we need to check
+        var uniqueDirectoriesToCheck = Set<String>()
 
-        // Create a new timer that fires every 3 seconds
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                await self?.refresh()
+        // First, collect all unique directories that don't have cached data
+        for session in sessions {
+            // Skip if we already have cached data for this exact path
+            if gitMonitor.getCachedRepository(for: session.workingDir) != nil {
+                continue
+            }
+
+            // Add this directory to check
+            uniqueDirectoriesToCheck.insert(session.workingDir)
+
+            // Smart detection: Also check common parent directories
+            // This helps when multiple sessions are in subdirectories of the same project
+            let pathComponents = session.workingDir.split(separator: "/").map(String.init)
+
+            // Check if this looks like a project directory pattern
+            // Common patterns: /Users/*/Projects/*, /Users/*/Development/*, etc.
+            if pathComponents.count >= 4 {
+                // Check if we're in a common development directory
+                let commonDevPaths = ["Projects", "Development", "Developer", "Code", "Work", "Source"]
+
+                for (index, component) in pathComponents.enumerated() {
+                    if commonDevPaths.contains(component) && index < pathComponents.count - 1 {
+                        // This might be a parent project directory
+                        // Add the immediate child of the development directory
+                        let potentialProjectPath = "/" + pathComponents[0...index + 1].joined(separator: "/")
+
+                        // Only add if we don't have cached data for it
+                        if gitMonitor.getCachedRepository(for: potentialProjectPath) == nil {
+                            uniqueDirectoriesToCheck.insert(potentialProjectPath)
+                        }
+                    }
+                }
             }
         }
+
+        // Now check each unique directory only once
+        for directory in uniqueDirectoriesToCheck {
+            Task {
+                // This will cache the data for immediate access later
+                _ = await gitMonitor.findRepository(for: directory)
+            }
+        }
+
+        logger
+            .debug(
+                "Pre-caching Git data for \(uniqueDirectoriesToCheck.count) unique directories (from \(sessions.count) sessions)"
+            )
     }
 }

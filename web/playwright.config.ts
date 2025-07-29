@@ -35,11 +35,12 @@ export default defineConfig({
       }
       console.warn(`Invalid PLAYWRIGHT_WORKERS value: "${process.env.PLAYWRIGHT_WORKERS}". Using default.`);
     }
-    // Default: 8 workers in CI, auto-detect locally
-    return process.env.CI ? 8 : undefined;
+    // Default: 1 worker in CI to prevent race conditions, auto-detect locally
+    // This ensures test groups run sequentially, preventing session conflicts
+    return process.env.CI ? 1 : undefined;
   })(),
   /* Test timeout */
-  timeout: process.env.CI ? 60 * 1000 : 30 * 1000, // 60s on CI, 30s locally
+  timeout: process.env.CI ? 30 * 1000 : 15 * 1000, // 30s on CI, 15s locally
   /* Reporter to use. See https://playwright.dev/docs/test-reporters */
   reporter: [
     ['html', { open: 'never' }],
@@ -60,10 +61,10 @@ export default defineConfig({
     video: process.env.CI ? 'retain-on-failure' : 'off',
 
     /* Maximum time each action can take */
-    actionTimeout: 15000, // Increased to 15s
+    actionTimeout: process.env.CI ? 10000 : 5000, // 10s on CI, 5s locally
 
-    /* Give browser more time to start on CI */
-    navigationTimeout: process.env.CI ? 30000 : 20000, // Increased timeouts
+    /* Navigation timeout */
+    navigationTimeout: process.env.CI ? 15000 : 10000, // 15s on CI, 10s locally
 
     /* Run in headless mode for better performance */
     headless: true,
@@ -99,13 +100,12 @@ export default defineConfig({
         '**/ui-features.spec.ts',
         '**/test-session-persistence.spec.ts',
         '**/session-navigation.spec.ts',
-        '**/session-management.spec.ts',
-        '**/session-management-advanced.spec.ts',
-        '**/file-browser-basic.spec.ts',
         '**/ssh-key-manager.spec.ts',
         '**/push-notifications.spec.ts',
         '**/authentication.spec.ts',
-        '**/activity-monitoring.spec.ts',
+      ],
+      testIgnore: [
+        '**/git-status-badge-debug.spec.ts',
       ],
     },
     // Serial tests - these tests perform global operations or modify shared state
@@ -113,9 +113,17 @@ export default defineConfig({
       name: 'chromium-serial',
       use: { ...devices['Desktop Chrome'] },
       testMatch: [
+        '**/session-management.spec.ts',
+        '**/session-management-advanced.spec.ts',
         '**/session-management-global.spec.ts',
         '**/keyboard-shortcuts.spec.ts',
+        '**/keyboard-capture-toggle.spec.ts',
         '**/terminal-interaction.spec.ts',
+        '**/activity-monitoring.spec.ts',
+        '**/file-browser-basic.spec.ts',
+      ],
+      testIgnore: [
+        '**/git-status-badge-debug.spec.ts',
       ],
       fullyParallel: false, // Override global setting for serial tests
     },
@@ -123,19 +131,25 @@ export default defineConfig({
 
   /* Run your local dev server before starting the tests */
   webServer: {
-    command: `pnpm exec tsx src/cli.ts --no-auth --port ${testConfig.port}`, // Use tsx everywhere
+    command: `node scripts/test-server.js --no-auth --port ${testConfig.port}`, // Use test server script
     port: testConfig.port,
     reuseExistingServer: !process.env.CI, // Reuse server locally for faster test runs
     stdout: process.env.CI ? 'inherit' : 'pipe', // Show output in CI for debugging
     stderr: process.env.CI ? 'inherit' : 'pipe', // Show errors in CI for debugging
-    timeout: 60 * 1000, // 1 minute for server startup (reduced from 3 minutes)
+    timeout: 30 * 1000, // 30 seconds for server startup
     cwd: process.cwd(), // Ensure we're in the right directory
-    env: {
-      ...process.env, // Include all existing env vars
-      NODE_ENV: 'test',
-      VIBETUNNEL_DISABLE_PUSH_NOTIFICATIONS: 'true',
-      SUPPRESS_CLIENT_ERRORS: 'true',
-      VIBETUNNEL_SEA: '', // Explicitly set to empty to disable SEA loader
-    },
+    env: (() => {
+      const env = { ...process.env };
+      // Keep VIBETUNNEL_SEA if it's set in CI, as we now use the native executable for tests
+      // In local development, it will be undefined and tests will use TypeScript compilation
+      return {
+        ...env,
+        NODE_ENV: 'test',
+        VIBETUNNEL_DISABLE_PUSH_NOTIFICATIONS: 'true',
+        SUPPRESS_CLIENT_ERRORS: 'true',
+        SHELL: '/bin/bash',
+        TERM: 'xterm',
+      };
+    })(),
   },
 });
